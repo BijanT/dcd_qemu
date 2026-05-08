@@ -20,6 +20,7 @@
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci/pcie_port.h"
+#include "system/hostmem.h"
 #include "hw/pci-bridge/pci_expander_bridge.h"
 
 static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
@@ -397,6 +398,19 @@ static GSList *cxl_fmws_get_all(void)
     return list;
 }
 
+static Object *cxl_fmw_get_link(Object *obj, const char *name)
+{
+    Error *local_err = NULL;
+    Object *link = object_property_get_link(obj, name, &local_err);
+
+    if (local_err) {
+        error_free(local_err);
+        return NULL;
+    }
+
+    return link;
+}
+
 static gint cfmws_cmp(gconstpointer a, gconstpointer b, gpointer d)
 {
     const struct CXLFixedWindow *ap = a;
@@ -418,6 +432,103 @@ static int cxl_fmws_mmio_map(Object *obj, void *opaque)
         return 0;
     }
     fw = CXL_FMW(obj);
+
+    if (fw->use_ram && !fw->ram_ready) {
+        Error *local_err = NULL;
+        uint64_t offset = 0;
+        PCIDevice *d = NULL;
+        Object *memdev = NULL;
+        MemoryRegion *mr = NULL;
+
+        if (fw->num_targets != 1) {
+            error_setg(&local_err,
+                       "cxl-fmw-ram requires exactly one target");
+        } else {
+            PCIHostState *hb;
+            PCIDevice *rp;
+            PXBCXLDev *pxb = fw->target_hbs[0];
+
+            hb = PCI_HOST_BRIDGE(pxb->cxl_host_bridge);
+            rp = pcie_find_port_first(hb->bus);
+
+            if (rp) {
+                d = pci_bridge_get_sec_bus(PCI_BRIDGE(rp))->devices[0];
+            }
+        }
+
+        if (!local_err && (!d || !object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3))) {
+            error_setg(&local_err,
+                       "cxl-fmw-ram could not find a single CXL type3 target");
+        }
+
+        if (!local_err) {
+            memdev = cxl_fmw_get_link(OBJECT(d), "volatile-memdev");
+        }
+        if (memdev) {
+            mr = host_memory_backend_get_memory(HOST_MEMORY_BACKEND(memdev));
+            memory_region_init_alias(&fw->vmem_alias, OBJECT(fw),
+                                     "cxl-fmw-vmem", mr, 0,
+                                     memory_region_size(mr));
+            memory_region_add_subregion(&fw->mr, offset, &fw->vmem_alias);
+            offset += memory_region_size(mr);
+        }
+
+        if (!local_err) {
+            memdev = cxl_fmw_get_link(OBJECT(d), "persistent-memdev");
+        }
+        if (memdev) {
+            mr = host_memory_backend_get_memory(HOST_MEMORY_BACKEND(memdev));
+            memory_region_init_alias(&fw->pmem_alias, OBJECT(fw),
+                                     "cxl-fmw-pmem", mr, 0,
+                                     memory_region_size(mr));
+            memory_region_add_subregion(&fw->mr, offset, &fw->pmem_alias);
+            offset += memory_region_size(mr);
+        }
+
+        if (!local_err && !memdev) {
+            memdev = cxl_fmw_get_link(OBJECT(d), "memdev");
+        }
+        if (memdev && offset == 0) {
+            mr = host_memory_backend_get_memory(HOST_MEMORY_BACKEND(memdev));
+            memory_region_init_alias(&fw->pmem_alias, OBJECT(fw),
+                                     "cxl-fmw-memdev", mr, 0,
+                                     memory_region_size(mr));
+            memory_region_add_subregion(&fw->mr, offset, &fw->pmem_alias);
+            offset += memory_region_size(mr);
+        }
+
+        if (!local_err) {
+            memdev = cxl_fmw_get_link(OBJECT(d), "volatile-dc-memdev");
+        }
+        if (memdev) {
+            mr = host_memory_backend_get_memory(HOST_MEMORY_BACKEND(memdev));
+            memory_region_init_alias(&fw->dc_alias, OBJECT(fw),
+                                     "cxl-fmw-dc", mr, 0,
+                                     memory_region_size(mr));
+            memory_region_add_subregion(&fw->mr, offset, &fw->dc_alias);
+            offset += memory_region_size(mr);
+        }
+
+        if (local_err || offset == 0) {
+            if (!local_err) {
+                error_setg(&local_err,
+                           "cxl-fmw-ram found no usable memory backend");
+            }
+            warn_report_err(local_err);
+            memory_region_destroy(&fw->mr);
+            memory_region_init_io(&fw->mr, OBJECT(fw), &cfmws_ops, fw,
+                                  "cxl-fixed-memory-region", fw->size);
+            fw->use_ram = false;
+        } else {
+            if (offset != fw->size) {
+                warn_report("CXL FMW RAM size %#" HWADDR_PRIx
+                            " does not match window size %#" HWADDR_PRIx,
+                            offset, fw->size);
+            }
+            fw->ram_ready = true;
+        }
+    }
+
     sysbus_mmio_map(SYS_BUS_DEVICE(fw), 0, fw->base);
 
     return 0;
@@ -451,8 +562,13 @@ static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 {
     CXLFixedWindow *fw = CXL_FMW(dev);
 
-    memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
-                          "cxl-fixed-memory-region", fw->size);
+    if (fw->use_ram) {
+        memory_region_init(&fw->mr, OBJECT(dev), "cxl-fixed-memory-region",
+                           fw->size);
+    } else {
+        memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
+                              "cxl-fixed-memory-region", fw->size);
+    }
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
 }
 
@@ -464,8 +580,13 @@ static void cxl_fmw_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    static const Property fw_props[] = {
+        DEFINE_PROP_BOOL("x-fmw-ram", CXLFixedWindow, use_ram, false),
+    };
+
     dc->desc = "CXL Fixed Memory Window";
     dc->realize = cxl_fmw_realize;
+    device_class_set_props(dc, fw_props);
     /* Reason - created by machines as tightly coupled to machine memory map */
     dc->user_creatable = false;
 }
