@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/bitmap.h"
+#include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/qtest.h"
@@ -30,6 +31,8 @@ static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
     CXLFixedWindow *fw = CXL_FMW(dev);
     strList *target;
     int i;
+
+    qemu_log("cxl_fixed_memory_window_config called %d\n", index);
 
     fw->index = index;
 
@@ -61,6 +64,12 @@ static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
         fw->enc_int_gran = 0;
     }
 
+    if (object->has_use_ram)
+        fw->use_ram = object->use_ram;
+    else
+        fw->use_ram = false;
+    fw->ram_ready = false;
+
     fw->targets = g_malloc0_n(fw->num_targets, sizeof(*fw->targets));
     for (i = 0, target = object->targets; target; i++, target = target->next) {
         /* This link cannot be resolved yet, so stash the name for now */
@@ -68,6 +77,117 @@ static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
     }
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), errp);
+}
+
+static Object *cxl_fmw_get_link(Object *obj, const char *name)
+{
+    Error *local_err = NULL;
+    Object *link = object_property_get_link(obj, name, &local_err);
+
+    if (local_err) {
+        qemu_log("Error resolving link for %s\n", name);
+        warn_report_err(local_err);
+        return NULL;
+    }
+
+    return link;
+}
+
+static void cxl_print_memory_region_hierarchy(MemoryRegion *mr, int level)
+{
+    MemoryRegion *subregion;
+
+    qemu_log("%*sMemoryRegion: %s: %lx-%lx\n", level * 2, " ", mr->name, (unsigned long)mr->addr, (unsigned long)(mr->addr + mr->size));
+    QTAILQ_FOREACH(subregion, &mr->subregions, subregions_link) {
+        cxl_print_memory_region_hierarchy(subregion, level + 1);
+        if (subregion == mr) {
+            qemu_log("%*sMemoryRegion %s contains itself\n", (level + 1) * 2, " ", subregion->name);
+        }
+    }
+}
+
+static  uint64_t cxl_add_fixed_window_subregion(CXLFixedWindow *fw, MemoryRegion *alias,
+    PCIDevice *cxl_dev, const char *memdev_name, uint64_t offset)
+{
+    Object *memdev = NULL;
+    MemoryRegion *mr = NULL;
+
+    memdev = cxl_fmw_get_link(OBJECT(cxl_dev), memdev_name);
+    if (!memdev)
+        return offset;
+
+    mr = host_memory_backend_get_memory(MEMORY_BACKEND(memdev));
+    if (!mr)
+        return offset;
+
+    memory_region_init_alias(alias, OBJECT(fw), memdev_name, mr, 0,
+                             memory_region_size(mr));
+    memory_region_add_subregion(&fw->mr, offset, alias);
+
+    offset += memory_region_size(mr);
+
+    return offset;
+}
+
+static void cxl_setup_ram_regions(CXLFixedWindow *fw, PXBCXLDev *pxb)
+{
+    uint64_t offset = 0;
+    Error *local_err = NULL;
+    PCIDevice *d = NULL;
+    PCIHostState *hb = NULL;
+    PCIDevice *rp = NULL;
+
+    qemu_log("%d\n", __LINE__);
+    if (fw->num_targets != 1) {
+        error_setg(&local_err, "use-ram=true requires exactly one target");
+        fw->use_ram = false;
+        goto not_ram;
+    }
+    qemu_log("%d %p\n", __LINE__, pxb);
+    hb = PCI_HOST_BRIDGE(pxb->cxl_host_bridge);
+    qemu_log("%d\n", __LINE__);
+    rp = pcie_find_port_first(hb->bus);
+    qemu_log("%d\n", __LINE__);
+    if (!rp) {
+        error_setg(&local_err, "Could not find root port for RAM-backed fixed memory window");
+        fw->use_ram = false;
+        goto not_ram;
+    }
+    qemu_log("%d\n", __LINE__);
+
+    d = pci_bridge_get_sec_bus(PCI_BRIDGE(rp))->devices[0];
+    if (!d || !object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
+        error_setg(&local_err, "Could not find CXL Type 3 target.");
+        fw->use_ram = false;
+        goto not_ram;
+    }
+    qemu_log("%d\n", __LINE__);
+
+    /* Add subregions for each memory device */
+    offset = cxl_add_fixed_window_subregion(fw, &fw->vmem_alias, d,
+        "volatile-memdev", offset);
+    offset = cxl_add_fixed_window_subregion(fw, &fw->pmem_alias, d,
+        "persistent-memdev", offset);
+    offset = cxl_add_fixed_window_subregion(fw, &fw->dc_alias, d,
+        "volatile-dc-memdev", offset);
+
+    qemu_log("%d\n", __LINE__);
+    if (offset != fw->size) {
+        error_setg(&local_err, "Size of memory devices does not match fixed window size");
+        /* TODO: cleanly unwind the RAM-backed setup and fall back instead of
+         * terminating QEMU here.
+         */
+        error_report_err(local_err);
+        exit(EXIT_FAILURE);
+    }
+    qemu_log("%d\n", __LINE__);
+
+    fw->ram_ready = true;
+
+not_ram:
+    qemu_log("%d\n", __LINE__);
+    if (local_err)
+        warn_report_err(local_err);
 }
 
 static int cxl_fmws_link(Object *obj, void *opaque)
@@ -81,6 +201,7 @@ static int cxl_fmws_link(Object *obj, void *opaque)
     }
     fw = CXL_FMW(obj);
 
+    qemu_log("cxl_fmws_link called %d %s\n", fw->num_targets, fw->targets[0]);
     for (i = 0; i < fw->num_targets; i++) {
         Object *o;
         bool ambig;
@@ -88,12 +209,19 @@ static int cxl_fmws_link(Object *obj, void *opaque)
         o = object_resolve_path_type(fw->targets[i], TYPE_PXB_CXL_DEV,
                                      &ambig);
         if (!o) {
+            qemu_log("Could not resolve path %s %d\n", fw->targets[i], ambig);
             error_setg(errp, "Could not resolve CXLFM target %s",
                        fw->targets[i]);
             return -1;
         }
         fw->target_hbs[i] = PXB_CXL_DEV(o);
     }
+
+    if (fw->use_ram && !fw->ram_ready) {
+        cxl_setup_ram_regions(fw, fw->target_hbs[0]);
+        cxl_print_memory_region_hierarchy(&fw->mr, 0);
+    }
+
     return 0;
 }
 
@@ -344,6 +472,7 @@ static void machine_set_cfmw(Object *obj, Visitor *v, const char *name,
 
 void cxl_machine_init(Object *obj, CXLState *state)
 {
+    qemu_log("cxl_machine_init called\n");
     object_property_add(obj, "cxl", "bool", machine_get_cxl,
                         machine_set_cxl, NULL, state);
     object_property_set_description(obj, "cxl",
@@ -419,6 +548,10 @@ static int cxl_fmws_mmio_map(Object *obj, void *opaque)
     }
     fw = CXL_FMW(obj);
     sysbus_mmio_map(SYS_BUS_DEVICE(fw), 0, fw->base);
+    qemu_log("cxl_fmws_mmio_map called %d %lx\n", fw->index, (unsigned long)fw->base);
+
+    /* Print out all of the subregions for the fixed memory window */
+    cxl_print_memory_region_hierarchy(&fw->mr, 0);
 
     return 0;
 }
@@ -433,6 +566,8 @@ hwaddr cxl_fmws_set_memmap(hwaddr base, hwaddr max_addr)
 {
     GSList *cfmws_list, *iter;
     CXLFixedWindow *fw;
+
+    qemu_log("cxl_fmws_set_memmap called base %lx max_addr %lx\n", base, max_addr);
 
     cfmws_list = cxl_fmws_get_all_sorted();
     for (iter = cfmws_list; iter; iter = iter->next) {
@@ -451,8 +586,15 @@ static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 {
     CXLFixedWindow *fw = CXL_FMW(dev);
 
-    memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
-                          "cxl-fixed-memory-region", fw->size);
+    qemu_log("cxl_fmw_realize called for index %d\n", fw->index);
+
+    if (fw->use_ram) {
+        memory_region_init(&fw->mr, OBJECT(fw), "cxl-fixed-memory-region",
+                           fw->size);
+    } else {
+        memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
+                              "cxl-fixed-memory-region", fw->size);
+    }
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
 }
 
@@ -463,6 +605,8 @@ static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 static void cxl_fmw_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+
+    qemu_log("cxl_fmw_class_init called\n");
 
     dc->desc = "CXL Fixed Memory Window";
     dc->realize = cxl_fmw_realize;

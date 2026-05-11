@@ -527,6 +527,7 @@ void pc_machine_done(Notifier *notifier, void *data)
                               &error_fatal);
 
     if (pcms->cxl_devices_state.is_enabled) {
+        qemu_log("Linking CXL Fixed Memory Windows to their targets\n");
         cxl_fmws_link_targets(&error_fatal);
     }
 

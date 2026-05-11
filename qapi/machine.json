@@ -551,6 +551,9 @@
 #     accesses will go to a given interleave target.  Accepted values
 #     [256, 512, 1k, 2k, 4k, 8k, 16k]
 #
+# @use-ram: Whether the CXL Fixed Memory Window should use the QEMU
+#     RAM backend for the CXL memory or the default MMIO backend.
+#
 # @targets: Target root bridge IDs from -device ...,id=<ID> for each
 #     root bridge.
 #
@@ -560,6 +563,7 @@
   'data': {
       'size': 'size',
       '*interleave-granularity': 'size',
+      '*use-ram': 'bool',
       'targets': ['str'] }}
 
 ##
