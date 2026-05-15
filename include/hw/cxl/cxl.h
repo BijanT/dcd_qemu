@@ -39,9 +39,12 @@ typedef struct CXLFixedWindow {
     bool use_ram;
     /* Todo: XOR based interleaving */
     MemoryRegion mr;
+    MemoryRegion base_mr;
     MemoryRegion vmem_alias;
     MemoryRegion pmem_alias;
-    MemoryRegion dc_alias;
+    MemoryRegion *dc_aliases;
+    uint64_t dc_alias_size;
+    uint64_t num_dc_aliases;
     hwaddr base;
 } CXLFixedWindow;
 #define TYPE_CXL_FMW "cxl-fmw"

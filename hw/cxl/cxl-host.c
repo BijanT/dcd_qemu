@@ -78,6 +78,13 @@ static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
         /* This link cannot be resolved yet, so stash the name for now */
         fw->targets[i] = g_strdup(target->value);
     }
+    /*
+     * Arbitrary size for now. Ideally should be the block size of the device.
+     * It should be no bigger than 256 MiB because that's what DCD regions are
+     * aligned to and we probably don't want a DC alias to span across multiple
+     * regions.
+     */
+    fw->dc_alias_size = 256 * MiB;
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), errp);
 }
@@ -109,27 +116,21 @@ static void cxl_print_memory_region_hierarchy(MemoryRegion *mr, int level)
     }
 }
 
-static  uint64_t cxl_add_fixed_window_subregion(CXLFixedWindow *fw, MemoryRegion *alias,
-    PCIDevice *cxl_dev, const char *memdev_name, uint64_t offset)
+static  uint64_t cxl_add_fixed_window_subregion(CXLFixedWindow *fw,
+    MemoryRegion *src, MemoryRegion *alias, const char *alias_name,
+    uint64_t fw_offset, uint64_t alias_offset, uint64_t alias_size)
 {
-    Object *memdev = NULL;
-    MemoryRegion *mr = NULL;
+    if (alias_size == 0)
+        alias_size = memory_region_size(src);
 
-    memdev = cxl_fmw_get_link(OBJECT(cxl_dev), memdev_name);
-    if (!memdev)
-        return offset;
+    memory_region_init_alias(alias, OBJECT(fw), alias_name, src, alias_offset,
+                             alias_size);
+    memory_region_set_enabled(alias, false);
+    memory_region_add_subregion_overlap(&fw->mr, fw_offset, alias, 1);
 
-    mr = host_memory_backend_get_memory(MEMORY_BACKEND(memdev));
-    if (!mr)
-        return offset;
+    fw_offset += alias_size;
 
-    memory_region_init_alias(alias, OBJECT(fw), memdev_name, mr, 0,
-                             memory_region_size(mr));
-    memory_region_add_subregion(&fw->mr, offset, alias);
-
-    offset += memory_region_size(mr);
-
-    return offset;
+    return fw_offset;
 }
 
 static void cxl_setup_ram_regions(CXLFixedWindow *fw, PXBCXLDev *pxb)
@@ -139,6 +140,8 @@ static void cxl_setup_ram_regions(CXLFixedWindow *fw, PXBCXLDev *pxb)
     PCIDevice *d = NULL;
     PCIHostState *hb = NULL;
     PCIDevice *rp = NULL;
+    Object *memdev = NULL;
+    MemoryRegion *mr = NULL;
 
     if (fw->num_targets != 1) {
         error_setg(&local_err, "use-ram=true requires exactly one target");
@@ -158,12 +161,43 @@ static void cxl_setup_ram_regions(CXLFixedWindow *fw, PXBCXLDev *pxb)
     }
 
     /* Add subregions for each memory device */
-    offset = cxl_add_fixed_window_subregion(fw, &fw->vmem_alias, d,
-        "volatile-memdev", offset);
-    offset = cxl_add_fixed_window_subregion(fw, &fw->pmem_alias, d,
-        "persistent-memdev", offset);
-    offset = cxl_add_fixed_window_subregion(fw, &fw->dc_alias, d,
-        "volatile-dc-memdev", offset);
+    memdev = cxl_fmw_get_link(OBJECT(d), "volatile-memdev");
+    if (memdev) {
+        mr = host_memory_backend_get_memory(MEMORY_BACKEND(memdev));
+        if (mr) {
+            offset = cxl_add_fixed_window_subregion(fw, mr, &fw->vmem_alias,
+                "volatile-region", offset, 0, 0);
+        }
+    }
+    memdev = cxl_fmw_get_link(OBJECT(d), "persistent-memdev");
+    if (memdev) {
+        mr = host_memory_backend_get_memory(MEMORY_BACKEND(memdev));
+        if (mr) {
+            offset = cxl_add_fixed_window_subregion(fw, mr, &fw->pmem_alias,
+                "persistent-region", offset, 0, 0);
+        }
+    }
+    memdev = cxl_fmw_get_link(OBJECT(d), "volatile-dc-memdev");
+    if (memdev) {
+        mr = host_memory_backend_get_memory(MEMORY_BACKEND(memdev));
+        if (mr) {
+            char *alias_name;
+            uint64_t dc_region_size = memory_region_size(mr);
+
+            fw->num_dc_aliases = dc_region_size / fw->dc_alias_size;
+            if (dc_region_size % fw->dc_alias_size)
+                fw->num_dc_aliases++;
+            fw->dc_aliases = g_new(MemoryRegion, fw->num_dc_aliases);
+            for (int i = 0; i < fw->num_dc_aliases; i++) {
+                uint64_t alias_offset = i * fw->dc_alias_size;
+                uint64_t alias_size = MIN(fw->dc_alias_size, dc_region_size - alias_offset);
+                alias_name = g_strdup_printf("volatile-dc-region-%d", i);
+                offset = cxl_add_fixed_window_subregion(fw, mr, &fw->dc_aliases[i],
+                    alias_name, offset, alias_offset, alias_size);
+                g_free(alias_name);
+            }
+        }
+    }
 
     if (offset != fw->size) {
         error_setg(&local_err, "Size of memory devices does not match fixed window size");
@@ -582,13 +616,10 @@ static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 
     qemu_log("cxl_fmw_realize called for index %d\n", fw->index);
 
-    if (fw->use_ram) {
-        memory_region_init(&fw->mr, OBJECT(fw), "cxl-fixed-memory-region",
-                           fw->size);
-    } else {
-        memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
-                              "cxl-fixed-memory-region", fw->size);
-    }
+    memory_region_init(&fw->mr, OBJECT(fw), "cxl-fixed-memory-region", fw->size);
+    memory_region_init_io(&fw->base_mr, OBJECT(dev), &cfmws_ops, fw,
+                          "cxl-fixed-memory-base-region", fw->size);
+    memory_region_add_subregion_overlap(&fw->mr, 0, &fw->base_mr, -1);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
 }
 
