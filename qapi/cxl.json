@@ -557,6 +557,25 @@
 }
 
 ##
+# @CXL_ADD_DYNAMIC_CAPACITY_RESPONSE:
+#
+# Event emitted when a CXL device receives a Add Dynamic Capacity
+# Response command defined in Compute Express Link (CXL)
+# Specification, Revision 3.2, Section 8.2.10.9.9.3.
+#
+# @path: path to the CXL Dynamic Capacity Device that received the
+#     command in the QOM tree.
+#
+# @extents: The "Updated Extent List" field as defined in Compute
+#     Express Link (CXL) Specification, Revision 3.2, Table 8-184.
+#
+##
+{ 'event': 'CXL_ADD_DYNAMIC_CAPACITY_RESPONSE',
+  'data': { 'path': 'str',
+            'extents': [ 'CxlDynamicCapacityExtent' ] }
+}
+
+##
 # @CxlExtentRemovalPolicy:
 #
 # The policy to use for selecting which extents comprise the released

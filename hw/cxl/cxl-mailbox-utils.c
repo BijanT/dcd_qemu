@@ -27,6 +27,7 @@
 #include "system/hostmem.h"
 #include "qemu/range.h"
 #include "qapi/qapi-types-cxl.h"
+#include "qapi/qapi-events-cxl.h"
 
 #define CXL_CAPACITY_MULTIPLIER   (256 * MiB)
 #define CXL_DC_EVENT_LOG_SIZE 8
@@ -3707,6 +3708,10 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
     CXLUpdateDCExtentListInPl *in = (void *)payload_in;
     CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
     CXLDCExtentList *extent_list = &ct3d->dc.extents;
+    CXLDCRegion *region;
+    CxlDynamicCapacityExtentList *event_ext_list = NULL;
+    CxlDynamicCapacityExtentList **event_ext_list_ptr = &event_ext_list;
+    CxlDynamicCapacityExtent *event_ext = NULL;
     uint32_t i, num;
     uint64_t dpa, len;
     CXLRetCode ret;
@@ -3750,10 +3755,21 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
         ct3d->dc.total_extent_count += 1;
         ct3d->dc.nr_extents_accepted += 1;
         ct3_set_region_block_backed(ct3d, dpa, len);
+
+        region = cxl_find_dc_region(ct3d, dpa, len);
+        if (region) {
+            event_ext = g_malloc0(sizeof(*event_ext));
+            event_ext->offset = dpa - region->base;
+            event_ext->len = len;
+            QAPI_LIST_APPEND(event_ext_list_ptr, event_ext);
+        }
     }
     /* Remove the first extent group in the pending list */
     num = cxl_extent_group_list_delete_front(&ct3d->dc.extents_pending);
     ct3d->dc.total_extent_count -= num;
+
+    qapi_event_send_cxl_add_dynamic_capacity_response(object_get_canonical_path_component(OBJECT(ct3d)), event_ext_list);
+    qapi_free_CxlDynamicCapacityExtentList(event_ext_list);
 
     return CXL_MBOX_SUCCESS;
 }
