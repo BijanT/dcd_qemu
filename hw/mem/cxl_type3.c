@@ -1197,6 +1197,7 @@ bool ct3_test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
 void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
                                    uint64_t len)
 {
+    CXLFixedWindow *fw;
     CXLDCRegion *region;
     uint64_t nbits;
     long nr;
@@ -1210,6 +1211,21 @@ void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
     nbits = len / region->block_size;
     QEMU_LOCK_GUARD(&region->bitmap_lock);
     bitmap_clear(region->blk_bitmap, nr, nbits);
+
+    /* Disable DCD RAM memory regions if they are no longer entirely backed */
+    fw = ct3_get_fixed_window(ct3d);
+    if (fw && fw->use_ram) {
+        while (len) {
+            uint64_t chunk_len = MIN(len, fw->dc_alias_size);
+            int dc_alias_index = (dpa - ct3d->dc.regions[0].base) / fw->dc_alias_size;
+            memory_region_set_enabled(&fw->dc_aliases[dc_alias_index], false);
+            qemu_log("FW %d: DC alias region [0x%" PRIx64 ", 0x%" PRIx64 ") is disabled\n",
+                     fw->index, dpa, dpa + chunk_len);
+
+            dpa += chunk_len;
+            len -= chunk_len;
+        }
+    }
 }
 
 static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
