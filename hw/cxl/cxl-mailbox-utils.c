@@ -3893,6 +3893,9 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
 {
     CXLUpdateDCExtentListInPl *in = (void *)payload_in;
     CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+    CxlDynamicCapacityExtentList *event_ext_list = NULL;
+    CxlDynamicCapacityExtentList **event_ext_list_ptr = &event_ext_list;
+    CxlDynamicCapacityExtent *event_ext = NULL;
     CXLDCExtentList updated_list;
     CXLDCExtent *ent, *ent_next;
     uint32_t updated_list_size;
@@ -3941,6 +3944,21 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
                                     ct3d->dc.nr_extents_accepted);
 
     ct3d->dc.nr_extents_accepted = updated_list_size;
+
+    for (uint32_t i = 0; i < in->num_entries_updated; i++) {
+        uint64_t dpa = in->updated_entries[i].start_dpa;
+        uint64_t len = in->updated_entries[i].len;
+
+        CXLDCRegion *region = cxl_find_dc_region(ct3d, dpa, len);
+        if (region) {
+            event_ext = g_malloc0(sizeof(*event_ext));
+            event_ext->offset = dpa - region->base;
+            event_ext->len = len;
+            QAPI_LIST_APPEND(event_ext_list_ptr, event_ext);
+        }
+    }
+    qapi_event_send_cxl_release_dynamic_capacity(object_get_canonical_path_component(OBJECT(ct3d)), event_ext_list);
+    qapi_free_CxlDynamicCapacityExtentList(event_ext_list);
 
     return CXL_MBOX_SUCCESS;
 }

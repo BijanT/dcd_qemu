@@ -655,3 +655,22 @@
            },
   'features': [ 'unstable' ]
 }
+
+##
+# @CXL_RELEASE_DYNAMIC_CAPACITY:
+#
+# Event emitted when a CXL device receives a Release Dynamic Capacity
+# command defined in Compute Express Link (CXL) Specification,
+# Revision 3.2, Section 8.2.10.9.9.4.
+#
+# @path: path to the CXL Dynamic Capacity Device that received the
+#     command in the QOM tree.
+#
+# @extents: The "Updated Extent List" field as defined in Compute
+#     Express Link (CXL) Specification, Revision 3.2, Table 8-184.
+#
+##
+{ 'event': 'CXL_RELEASE_DYNAMIC_CAPACITY',
+  'data': { 'path': 'str',
+            'extents': [ 'CxlDynamicCapacityExtent' ] }
+}
