@@ -17,6 +17,7 @@
 #include "hw/mem/memory-device.h"
 #include "hw/mem/pc-dimm.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_bridge.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "qapi/error.h"
@@ -29,7 +30,9 @@
 #include "system/hostmem.h"
 #include "system/numa.h"
 #include "hw/cxl/cxl.h"
+#include "hw/cxl/cxl_host.h"
 #include "hw/pci/msix.h"
+#include "hw/pci/pci_bus.h"
 
 /* type3 device private */
 enum CXL_T3_MSIX_VECTOR {
@@ -1082,6 +1085,51 @@ static void ct3_exit(PCIDevice *pci_dev)
     }
 }
 
+static CXLFixedWindow *ct3_get_fixed_window(CXLType3Dev *ct3d)
+{
+    GSList *fw_list, *iter;
+    CXLFixedWindow *fw = NULL;
+    PCIDevice *pdev;
+    PCIBus *rootbus;
+    PCIHostState *hb;
+    CXLHost *cxl_hb, *checked_hb;
+
+    pdev = PCI_DEVICE(ct3d);
+    rootbus = pci_device_root_bus(pdev);
+    hb = PCI_HOST_BRIDGE(rootbus->qbus.parent);
+    cxl_hb = PXB_CXL_HOST(hb);
+
+    fw_list = cxl_fmws_get_all_sorted();
+    for (iter = fw_list; iter; iter = iter->next) {
+        CXLFixedWindow *fw_candidate = (CXLFixedWindow *)iter->data;
+        for (int i = 0; i < fw_candidate->num_targets; i++) {
+            checked_hb = fw_candidate->target_hbs[i]->cxl_host_bridge;
+            if (checked_hb == cxl_hb) {
+                fw = fw_candidate;
+                break;
+            }
+        }
+    }
+    g_slist_free(fw_list);
+
+    return fw;
+}
+
+/* region->bitmap_lock should be held */
+static bool ct3_test_region_block_backed_inner(CXLDCRegion *region, uint64_t dpa, uint64_t len)
+{
+    uint64_t nbits;
+    long nr;
+
+    nr = (dpa - region->base) / region->block_size;
+    nbits = DIV_ROUND_UP(len, region->block_size);
+    /*
+     * if bits between [dpa, dpa + len) are all 1s, meaning the DPA range is
+     * backed with DC extents, return true; else return false.
+     */
+    return find_next_zero_bit(region->blk_bitmap, nr + nbits, nr) == nr + nbits;
+}
+
 /*
  * Mark the DPA range [dpa, dap + len - 1] to be backed and accessible. This
  * happens when a DC extent is added and accepted by the host.
@@ -1090,6 +1138,7 @@ void ct3_set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
                                  uint64_t len)
 {
     CXLDCRegion *region;
+    CXLFixedWindow *fw;
 
     region = cxl_find_dc_region(ct3d, dpa, len);
     if (!region) {
@@ -1099,6 +1148,28 @@ void ct3_set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
     QEMU_LOCK_GUARD(&region->bitmap_lock);
     bitmap_set(region->blk_bitmap, (dpa - region->base) / region->block_size,
                len / region->block_size);
+
+    /*
+     * Enable DCD RAM memory regions if they are entirely backed.
+     * If the region is only partially backed, it will be handled by the
+     * the MMIO read/write handlers.
+     */
+    fw = ct3_get_fixed_window(ct3d);
+    if (fw && fw->use_ram) {
+        while (len) {
+            uint64_t chunk_len = MIN(len, fw->dc_alias_size);
+
+            if (ct3_test_region_block_backed_inner(region, dpa, chunk_len)) {
+                int dc_alias_index = (dpa - ct3d->dc.regions[0].base) / fw->dc_alias_size;
+                memory_region_set_enabled(&fw->dc_aliases[dc_alias_index], true);
+                qemu_log("FW %d: DC alias region [0x%" PRIx64 ", 0x%" PRIx64 ") is enabled\n",
+                         fw->index, dpa, dpa + chunk_len);
+            }
+
+            dpa += chunk_len;
+            len -= chunk_len;
+        }
+    }
 }
 
 /*
@@ -1109,22 +1180,14 @@ bool ct3_test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
                                   uint64_t len)
 {
     CXLDCRegion *region;
-    uint64_t nbits;
-    long nr;
 
     region = cxl_find_dc_region(ct3d, dpa, len);
     if (!region) {
         return false;
     }
 
-    nr = (dpa - region->base) / region->block_size;
-    nbits = DIV_ROUND_UP(len, region->block_size);
-    /*
-     * if bits between [dpa, dpa + len) are all 1s, meaning the DPA range is
-     * backed with DC extents, return true; else return false.
-     */
     QEMU_LOCK_GUARD(&region->bitmap_lock);
-    return find_next_zero_bit(region->blk_bitmap, nr + nbits, nr) == nr + nbits;
+    return ct3_test_region_block_backed_inner(region, dpa, len);
 }
 
 /*
