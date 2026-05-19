@@ -634,6 +634,13 @@ typedef struct CXLMemSparingWriteAttrs {
 
 #define DCD_MAX_NUM_REGION 8
 
+/* CXL r3.1 Table 8-169: Updated Extent */
+typedef struct CXLDCUpdatedExtent {
+    uint64_t start_dpa;
+    uint64_t len;
+    uint8_t rsvd[8];
+} QEMU_PACKED CXLDCUpdatedExtent;
+
 typedef struct CXLDCExtentRaw {
     uint64_t start_dpa;
     uint64_t len;

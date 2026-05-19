@@ -3600,12 +3600,7 @@ typedef struct CXLUpdateDCExtentListInPl {
     uint32_t num_entries_updated;
     uint8_t flags;
     uint8_t rsvd[3];
-    /* CXL r3.1 Table 8-169: Updated Extent */
-    struct {
-        uint64_t start_dpa;
-        uint64_t len;
-        uint8_t rsvd[8];
-    } QEMU_PACKED updated_entries[];
+    CXLDCUpdatedExtent updated_entries[];
 } QEMU_PACKED CXLUpdateDCExtentListInPl;
 
 /*
@@ -3617,7 +3612,7 @@ typedef struct CXLUpdateDCExtentListInPl {
  * 4. The address range of multiple extents in the list should not overlap.
  */
 static CXLRetCode cxl_detect_malformed_extent_list(CXLType3Dev *ct3d,
-        const CXLUpdateDCExtentListInPl *in)
+        const CXLDCUpdatedExtent *in, uint32_t num_entries_updated)
 {
     uint64_t min_block_size = UINT64_MAX;
     CXLDCRegion *region;
@@ -3634,9 +3629,9 @@ static CXLRetCode cxl_detect_malformed_extent_list(CXLType3Dev *ct3d,
     blk_bitmap = bitmap_new((lastregion->base + lastregion->len -
                              ct3d->dc.regions[0].base) / min_block_size);
 
-    for (i = 0; i < in->num_entries_updated; i++) {
-        dpa = in->updated_entries[i].start_dpa;
-        len = in->updated_entries[i].len;
+    for (i = 0; i < num_entries_updated; i++) {
+        dpa = in[i].start_dpa;
+        len = in[i].len;
 
         region = cxl_find_dc_region(ct3d, dpa, len);
         if (!region) {
@@ -3737,7 +3732,8 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
         return CXL_MBOX_RESOURCES_EXHAUSTED;
     }
 
-    ret = cxl_detect_malformed_extent_list(ct3d, in);
+    ret = cxl_detect_malformed_extent_list(ct3d, in->updated_entries,
+                                           in->num_entries_updated);
     if (ret != CXL_MBOX_SUCCESS) {
         return ret;
     }
@@ -3797,8 +3793,8 @@ static uint32_t copy_extent_list(CXLDCExtentList *dst,
 }
 
 static CXLRetCode cxl_dc_extent_release_dry_run(CXLType3Dev *ct3d,
-        const CXLUpdateDCExtentListInPl *in, CXLDCExtentList *updated_list,
-        uint32_t *updated_list_size)
+        const CXLDCUpdatedExtent *in, const uint32_t in_size,
+        CXLDCExtentList *updated_list, uint32_t *updated_list_size)
 {
     CXLDCExtent *ent, *ent_next;
     uint64_t dpa, len;
@@ -3809,11 +3805,11 @@ static CXLRetCode cxl_dc_extent_release_dry_run(CXLType3Dev *ct3d,
     QTAILQ_INIT(updated_list);
     copy_extent_list(updated_list, &ct3d->dc.extents);
 
-    for (i = 0; i < in->num_entries_updated; i++) {
+    for (i = 0; i < in_size; i++) {
         Range range;
 
-        dpa = in->updated_entries[i].start_dpa;
-        len = in->updated_entries[i].len;
+        dpa = in[i].start_dpa;
+        len = in[i].len;
 
         /* Check if the DPA range is not fully backed with valid extents */
         if (!ct3_test_region_block_backed(ct3d, dpa, len)) {
@@ -3881,45 +3877,20 @@ free_and_exit:
     return ret;
 }
 
-/*
- * CXL r3.1 section 8.2.9.9.9.4: Release Dynamic Capacity (Opcode 4803h)
- */
-static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
-                                          uint8_t *payload_in,
-                                          size_t len_in,
-                                          uint8_t *payload_out,
-                                          size_t *len_out,
-                                          CXLCCI *cci)
+static CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in,
+        const uint32_t in_size)
 {
-    CXLUpdateDCExtentListInPl *in = (void *)payload_in;
-    CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
-    CxlDynamicCapacityExtentList *event_ext_list = NULL;
-    CxlDynamicCapacityExtentList **event_ext_list_ptr = &event_ext_list;
-    CxlDynamicCapacityExtent *event_ext = NULL;
-    CXLDCExtentList updated_list;
     CXLDCExtent *ent, *ent_next;
+    CXLDCExtentList updated_list;
     uint32_t updated_list_size;
     CXLRetCode ret;
 
-    if (len_in < sizeof(*in)) {
-        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
-    }
-
-    if (in->num_entries_updated == 0) {
-        return CXL_MBOX_INVALID_INPUT;
-    }
-
-    if (len_in <
-        sizeof(*in) + sizeof(*in->updated_entries) * in->num_entries_updated) {
-        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
-    }
-
-    ret = cxl_detect_malformed_extent_list(ct3d, in);
+    ret = cxl_detect_malformed_extent_list(ct3d, in, in_size);
     if (ret != CXL_MBOX_SUCCESS) {
         return ret;
     }
 
-    ret = cxl_dc_extent_release_dry_run(ct3d, in, &updated_list,
+    ret = cxl_dc_extent_release_dry_run(ct3d, in, in_size, &updated_list,
                                         &updated_list_size);
     if (ret != CXL_MBOX_SUCCESS) {
         return ret;
@@ -3944,6 +3915,44 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
                                     ct3d->dc.nr_extents_accepted);
 
     ct3d->dc.nr_extents_accepted = updated_list_size;
+
+    return CXL_MBOX_SUCCESS;
+}
+
+/*
+ * CXL r3.1 section 8.2.9.9.9.4: Release Dynamic Capacity (Opcode 4803h)
+ */
+static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
+                                          uint8_t *payload_in,
+                                          size_t len_in,
+                                          uint8_t *payload_out,
+                                          size_t *len_out,
+                                          CXLCCI *cci)
+{
+    CXLUpdateDCExtentListInPl *in = (void *)payload_in;
+    CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+    CxlDynamicCapacityExtentList *event_ext_list = NULL;
+    CxlDynamicCapacityExtentList **event_ext_list_ptr = &event_ext_list;
+    CxlDynamicCapacityExtent *event_ext = NULL;
+    CXLRetCode ret;
+
+    if (len_in < sizeof(*in)) {
+        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
+    }
+
+    if (in->num_entries_updated == 0) {
+        return CXL_MBOX_INVALID_INPUT;
+    }
+
+    if (len_in <
+        sizeof(*in) + sizeof(*in->updated_entries) * in->num_entries_updated) {
+        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
+    }
+
+    ret = cxl_dc_extent_release(ct3d, in->updated_entries, in->num_entries_updated);
+    if (ret != CXL_MBOX_SUCCESS) {
+        return ret;
+    }
 
     for (uint32_t i = 0; i < in->num_entries_updated; i++) {
         uint64_t dpa = in->updated_entries[i].start_dpa;
@@ -4316,7 +4325,8 @@ static CXLRetCode cmd_fm_initiate_dc_add(const struct cxl_cmd *cmd,
                     in->ext_count * sizeof(*list->updated_entries));
 
             convert_raw_extents(in->extents, list, in->ext_count);
-            rc = cxl_detect_malformed_extent_list(ct3d, list);
+            rc = cxl_detect_malformed_extent_list(ct3d, list->updated_entries,
+                                                  list->num_entries_updated);
 
             for (i = 0; i < in->ext_count; i++) {
                 CXLDCExtentRaw *ext = &in->extents[i];
@@ -4399,7 +4409,8 @@ static CXLRetCode cmd_fm_initiate_dc_release(const struct cxl_cmd *cmd,
                     in->ext_count * sizeof(*list->updated_entries));
 
             convert_raw_extents(in->extents, list, in->ext_count);
-            rc = cxl_detect_malformed_extent_list(ct3d, list);
+            rc = cxl_detect_malformed_extent_list(ct3d, list->updated_entries,
+                                                  list->num_entries_updated);
             if (rc) {
                 return rc;
             }
@@ -4425,7 +4436,8 @@ static CXLRetCode cmd_fm_initiate_dc_release(const struct cxl_cmd *cmd,
             }
 
             rc = cxl_dc_extent_release_dry_run(ct3d,
-                                               list,
+                                               list->updated_entries,
+                                               list->num_entries_updated,
                                                &updated_list,
                                                &updated_list_size);
             if (rc) {
