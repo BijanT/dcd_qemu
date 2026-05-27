@@ -854,6 +854,8 @@ void cxl_clear_poison_list_overflowed(CXLType3Dev *ct3d);
 
 CXLDCRegion *cxl_find_dc_region(CXLType3Dev *ct3d, uint64_t dpa, uint64_t len);
 
+CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in,
+        const uint32_t in_size);
 void cxl_remove_extent_from_extent_list(CXLDCExtentList *list,
                                         CXLDCExtent *extent);
 void cxl_insert_extent_to_extent_list(CXLDCExtentList *list, uint64_t dpa,

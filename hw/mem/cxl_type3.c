@@ -2364,6 +2364,7 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
     CxlDynamicCapacityExtentList *list;
     CXLDCExtentGroup *group = NULL;
     g_autofree CXLDCExtentRaw *extents = NULL;
+    g_autofree CXLDCUpdatedExtent *updated_extents = NULL;
     uint64_t dpa, offset, len, block_size;
     g_autofree unsigned long *blk_bitmap = NULL;
     int i;
@@ -2418,7 +2419,7 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
         }
         bitmap_set(blk_bitmap, offset / block_size, len / block_size);
 
-        if (type == DC_EVENT_RELEASE_CAPACITY) {
+        if (type == DC_EVENT_RELEASE_CAPACITY || type == DC_EVENT_FORCED_RELEASE_CAPACITY) {
             if (cxl_extent_groups_overlaps_dpa_range(&dcd->dc.extents_pending,
                                                      dpa, len)) {
                 error_setg(errp,
@@ -2451,13 +2452,14 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
     i = 0;
     list = records;
     extents = g_new0(CXLDCExtentRaw, num_extents);
+    updated_extents = g_new0(CXLDCUpdatedExtent, num_extents);
     while (list) {
         offset = list->value->offset;
         len = list->value->len;
         dpa = dcd->dc.regions[rid].base + offset;
 
-        extents[i].start_dpa = dpa;
-        extents[i].len = len;
+        updated_extents[i].start_dpa = extents[i].start_dpa = dpa;
+        updated_extents[i].len = extents[i].len = len;
         memset(extents[i].tag, 0, 0x10);
         extents[i].shared_seq = 0;
         if (type == DC_EVENT_ADD_CAPACITY) {
@@ -2474,6 +2476,12 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
     if (group) {
         cxl_extent_group_list_insert_tail(&dcd->dc.extents_pending, group);
         dcd->dc.total_extent_count += num_extents;
+    }
+    if (type == DC_EVENT_FORCED_RELEASE_CAPACITY) {
+        CXLRetCode ret = cxl_dc_extent_release(dcd, updated_extents, num_extents);
+        if (ret != CXL_MBOX_SUCCESS) {
+            error_setg(errp, "Failed to release extents from device");
+        }
     }
 
     cxl_create_dc_event_records_for_extents(dcd, type, extents, num_extents);
@@ -2510,12 +2518,8 @@ void qmp_cxl_release_dynamic_capacity(const char *path, uint16_t host_id,
 {
     CXLDCEventType type = DC_EVENT_RELEASE_CAPACITY;
 
-    if (has_forced_removal && forced_removal) {
-        /* TODO: enable forced removal in the future */
+    if (has_forced_removal && forced_removal)
         type = DC_EVENT_FORCED_RELEASE_CAPACITY;
-        error_setg(errp, "Forced removal not supported yet");
-        return;
-    }
 
     switch (removal_policy) {
     case CXL_EXTENT_REMOVAL_POLICY_PRESCRIPTIVE:
