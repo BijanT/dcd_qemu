@@ -341,6 +341,9 @@ MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run);
 
 int kvm_arch_handle_exit(CPUState *cpu, struct kvm_run *run);
 
+int kvm_arch_handle_mmio_error(CPUState *cpu, struct kvm_run *run,
+                               MemTxResult mmio_res);
+
 int kvm_arch_process_async_events(CPUState *cpu);
 
 int kvm_arch_get_registers(CPUState *cpu, Error **errp);

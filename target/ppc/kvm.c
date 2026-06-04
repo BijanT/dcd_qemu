@@ -1728,6 +1728,12 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
     return ret;
 }
 
+int kvm_arch_handle_mmio_error(CPUState *cpu, struct kvm_run *run,
+                               MemTxResult mmio_res)
+{
+    return 0;
+}
+
 int kvmppc_or_tsr_bits(PowerPCCPU *cpu, uint32_t tsr_bits)
 {
     CPUState *cs = CPU(cpu);

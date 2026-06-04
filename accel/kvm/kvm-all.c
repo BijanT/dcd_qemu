@@ -3530,12 +3530,18 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
-            address_space_rw(&address_space_memory,
-                             run->mmio.phys_addr, attrs,
-                             run->mmio.data,
-                             run->mmio.len,
-                             run->mmio.is_write);
-            ret = 0;
+            MemTxResult mmio_res;
+
+            mmio_res = address_space_rw(&address_space_memory,
+                                        run->mmio.phys_addr, attrs,
+                                        run->mmio.data,
+                                        run->mmio.len,
+                                        run->mmio.is_write);
+            if (mmio_res != MEMTX_OK) {
+                ret = kvm_arch_handle_mmio_error(cpu, run, mmio_res);
+            } else {
+                ret = 0;
+            }
             break;
         case KVM_EXIT_IRQ_WINDOW_OPEN:
             ret = EXCP_INTERRUPT;

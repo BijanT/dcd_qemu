@@ -1730,6 +1730,12 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
     return ret;
 }
 
+int kvm_arch_handle_mmio_error(CPUState *cpu, struct kvm_run *run,
+                               MemTxResult mmio_res)
+{
+    return 0;
+}
+
 void kvm_riscv_reset_vcpu(RISCVCPU *cpu)
 {
     CPURISCVState *env = &cpu->env;

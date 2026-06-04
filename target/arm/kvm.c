@@ -1561,6 +1561,12 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
     return ret;
 }
 
+int kvm_arch_handle_mmio_error(CPUState *cpu, struct kvm_run *run,
+                               MemTxResult mmio_res)
+{
+    return 0;
+}
+
 bool kvm_arch_stop_on_emulation_error(CPUState *cs)
 {
     return true;

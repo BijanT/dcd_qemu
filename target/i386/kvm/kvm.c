@@ -697,7 +697,8 @@ static int kvm_get_mce_cap_supported(KVMState *s, uint64_t *mce_cap,
     return kvm_ioctl(s, KVM_X86_GET_MCE_CAP_SUPPORTED, mce_cap);
 }
 
-static void kvm_mce_inject(X86CPU *cpu, hwaddr paddr, int code)
+static void kvm_mce_inject_common(X86CPU *cpu, hwaddr paddr, int code,
+                                  bool force_local)
 {
     CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
@@ -737,7 +738,9 @@ static void kvm_mce_inject(X86CPU *cpu, hwaddr paddr, int code)
         }
     }
 
-    flags = cpu_x86_support_mca_broadcast(env) ? MCE_INJECT_BROADCAST : 0;
+    if (!force_local) {
+        flags = cpu_x86_support_mca_broadcast(env) ? MCE_INJECT_BROADCAST : 0;
+    }
     /* We need to read back the value of MSR_EXT_MCG_CTL that was set by the
      * guest kernel back into env->mcg_ext_ctl.
      */
@@ -749,6 +752,16 @@ static void kvm_mce_inject(X86CPU *cpu, hwaddr paddr, int code)
 
     cpu_x86_inject_mce(NULL, cpu, 9, status, mcg_status, paddr,
                        (MCM_ADDR_PHYS << 6) | 0xc, flags);
+}
+
+static void kvm_mce_inject(X86CPU *cpu, hwaddr paddr, int code)
+{
+    kvm_mce_inject_common(cpu, paddr, code, false);
+}
+
+static void kvm_mce_inject_local(X86CPU *cpu, hwaddr paddr, int code)
+{
+    kvm_mce_inject_common(cpu, paddr, code, true);
 }
 
 static void emit_hypervisor_memory_failure(MemoryFailureAction action, bool ar)
@@ -6656,6 +6669,28 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
     }
 
     return ret;
+}
+
+int kvm_arch_handle_mmio_error(CPUState *cpu, struct kvm_run *run,
+                               MemTxResult mmio_res)
+{
+    if (mmio_res & MEMTX_ERROR) {
+        bql_lock();
+        kvm_mce_inject_local(X86_CPU(cpu), run->mmio.phys_addr,
+                             BUS_MCEERR_AR);
+        bql_unlock();
+        /*
+         * kvm_arch_process_async_events() — which converts
+         * CPU_INTERRUPT_MCE into a queued #MC exception via
+         * kvm_queue_exception() — is only called at the top of
+         * kvm_cpu_exec(), not on each inner loop iteration.
+         * Exit the loop so the next kvm_cpu_exec() invocation
+         * delivers the MCE to the guest before re-entering KVM.
+         */
+        return cpu_test_interrupt(cpu, CPU_INTERRUPT_MCE) ? EXCP_INTERRUPT : 0;
+    }
+
+    return 0;
 }
 
 bool kvm_arch_stop_on_emulation_error(CPUState *cs)
