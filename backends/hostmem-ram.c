@@ -41,6 +41,7 @@ ram_backend_class_init(ObjectClass *oc, const void *data)
 {
     HostMemoryBackendClass *bc = MEMORY_BACKEND_CLASS(oc);
 
+    bc->supports_donation = true;
     bc->alloc = ram_backend_memory_alloc;
 }
 

@@ -650,6 +650,10 @@
 # @prealloc-context: thread context to use for creation of
 #     preallocation threads (default: none) (since 7.2)
 #
+# @donatable: if true, the memory can be donated to be used as
+#     ephemeral memory.  Incompatible with 'reserve=on' or
+#     'prealloc=on' (default: false)
+#
 # @share: if false, the memory is private to QEMU; if true, it is
 #     shared (default false for backends memory-backend-file and
 #     memory-backend-ram, true for backends memory-backend-epc,
@@ -681,6 +685,7 @@
             '*prealloc': 'bool',
             '*prealloc-threads': 'uint32',
             '*prealloc-context': 'str',
+            '*donatable': 'bool',
             '*share': 'bool',
             '*reserve': 'bool',
             'size': 'size',

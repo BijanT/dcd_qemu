@@ -340,6 +340,27 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
     size_t pagesize;
     bool async = !phase_check(PHASE_LATE_BACKENDS_CREATED);
 
+    if (backend->donatable) {
+        if (!bc->supports_donation) {
+            error_setg(errp, "'donatable=on' is not supported by backend '%s'",
+                       object_get_typename(OBJECT(uc)));
+            return;
+        }
+        if (backend->guest_memfd) {
+            error_setg(errp, "'donatable=on' is not supported on machine "
+                       "types that require guest_memfd");
+            return;
+        }
+        if (backend->share) {
+            error_setg(errp, "'donatable=on' and 'share=on' are incompatible");
+            return;
+        }
+        if (backend->reserve) {
+            error_setg(errp,
+                       "'donatable=on' and 'reserve=on' are incompatible");
+            return;
+        }
+    }
     if (!bc->alloc) {
         return;
     }
@@ -461,6 +482,26 @@ static void host_memory_backend_set_share(Object *o, bool value, Error **errp)
 }
 
 #ifdef CONFIG_LINUX
+static bool host_memory_backend_get_donatable(Object *obj, Error **errp)
+{
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+
+    return backend->donatable;
+}
+
+static void host_memory_backend_set_donatable(Object *obj, bool value,
+    Error **errp)
+{
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+
+    if (host_memory_backend_mr_inited(backend)) {
+        error_setg(errp, "cannot change property value");
+        return;
+    }
+
+    backend->donatable = value;
+}
+
 static bool host_memory_backend_get_reserve(Object *o, Error **errp)
 {
     HostMemoryBackend *backend = MEMORY_BACKEND(o);
@@ -558,6 +599,11 @@ host_memory_backend_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "share",
         "Mark the memory as private to QEMU or shared");
 #ifdef CONFIG_LINUX
+    object_class_property_add_bool(oc, "donatable",
+        host_memory_backend_get_donatable,
+        host_memory_backend_set_donatable);
+    object_class_property_set_description(oc, "donatable",
+        "If true, the memory can be donated to be used as ephemeral memory");
     object_class_property_add_bool(oc, "reserve",
         host_memory_backend_get_reserve, host_memory_backend_set_reserve);
     object_class_property_set_description(oc, "reserve",

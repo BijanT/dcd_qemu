@@ -873,6 +873,9 @@
 #
 # @prealloc: whether memory was preallocated
 #
+# @donatable: whether memory can be donated to be used as ephemeral
+#     memory
+#
 # @share: whether memory is private to QEMU or shared (since 6.1)
 #
 # @reserve: whether swap space (or huge pages) was reserved if
@@ -894,6 +897,7 @@
     'merge':      'bool',
     'dump':       'bool',
     'prealloc':   'bool',
+    '*donatable': 'bool',
     'share':      'bool',
     '*reserve':    'bool',
     'host-nodes': ['uint16'],

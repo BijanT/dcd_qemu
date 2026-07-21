@@ -211,6 +211,12 @@ static int query_memdev(Object *obj, void *opaque)
         m->merge = object_property_get_bool(obj, "merge", &error_abort);
         m->dump = object_property_get_bool(obj, "dump", &error_abort);
         m->prealloc = object_property_get_bool(obj, "prealloc", &error_abort);
+        m->donatable = object_property_get_bool(obj, "donatable", &err);
+        if (err) {
+            error_free_or_abort(&err);
+        } else {
+            m->has_donatable = true;
+        }
         m->share = object_property_get_bool(obj, "share", &error_abort);
         m->reserve = object_property_get_bool(obj, "reserve", &err);
         if (err) {

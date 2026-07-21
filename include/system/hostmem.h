@@ -50,6 +50,19 @@ struct HostMemoryBackendClass {
     ObjectClass parent_class;
 
     /**
+     * @supports_donation:
+     * If true, the backend supports donation of memory to be used for
+     * ephemeral memory.
+     *
+     * Note this is inherited by derived types, since a class is built by
+     * copying its parent's class before its own class_init() runs.  A
+     * backend derived from one that supports donation must therefore clear
+     * this explicitly unless its alloc() also honours the constraints
+     * donation depends on (notably 'reserve=off', i.e. RAM_NORESERVE).
+     */
+    bool supports_donation;
+
+    /**
      * alloc: Allocate memory from backend.
      *
      * @backend: the #HostMemoryBackend.
@@ -75,7 +88,7 @@ struct HostMemoryBackend {
     /* protected */
     uint64_t size;
     bool merge, dump, use_canonical_path;
-    bool prealloc, is_mapped, share, reserve;
+    bool prealloc, donatable, is_mapped, share, reserve;
     bool guest_memfd, aligned;
     uint32_t prealloc_threads;
     ThreadContext *prealloc_context;
