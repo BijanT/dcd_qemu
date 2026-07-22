@@ -34,6 +34,7 @@ qapi_all_modules = [
   'cxl',
   'dump',
   'ebpf',
+  'eph-mem',
   'error',
   'introspect',
   'job',

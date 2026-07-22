@@ -87,6 +87,7 @@ struct HostMemoryBackend {
 
     /* protected */
     uint64_t size;
+    uint64_t donated_size;
     bool merge, dump, use_canonical_path;
     bool prealloc, donatable, is_mapped, share, reserve;
     bool guest_memfd, aligned;

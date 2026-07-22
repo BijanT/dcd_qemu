@@ -1,0 +1,81 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+
+##
+# ********************
+# Ephemeral Memory API
+# ********************
+##
+
+##
+# @EphMemDonateResult:
+#
+# Return value for eph-mem-donate-capacity command specifying how
+# much memory is granted for donation.
+#
+# @granted: The amount of ephemeral memory that the guest has agreed
+#    to donate, in bytes.
+##
+{ 'struct': 'EphMemDonateResult',
+  'data': { 'granted': 'uint64' }
+}
+
+##
+# @eph-mem-donate-capacity:
+#
+# Ask the guest to donate some capacity of the specified memory
+# object for use as ephemeral memory.  Returns the amount of memory
+# the guest has agreed to donate, which may be less than requested.
+#
+# @path: path in the QOM tree to the memory object to donate capacity
+#    from
+#
+# @size: the amount of memory requested for donation, in bytes.  The
+#    guest may choose to donate less than this amount, or not at all.
+#
+##
+{ 'command': 'eph-mem-donate-capacity',
+  'data': { 'path': 'str', 'size': 'uint64' },
+  'returns': 'EphMemDonateResult'
+}
+
+##
+# @EPH_MEM_REVOKE:
+#
+# Event emitted by QEMU to indicate that it is revoking its previous
+# donation of ephemeral memory.
+#
+# @path: path in the QOM tree to the memory object that is revoking
+#    its donation
+#
+# @size: the amount of memory that is being revoked, in bytes.
+#
+# @id: identifier used to connect the EPH_MEM_REVOKE event with the
+#    eph-mem-return-capacity command.
+#
+##
+{ 'event': 'EPH_MEM_REVOKE',
+  'data': { 'path': 'str', 'size': 'uint64', 'id': 'int' }
+}
+
+##
+# @eph-mem-return-capacity:
+#
+# Command used by the orchestrator to inform QEMU that some of its
+# donated memory has been returned.  This can be sent in response to
+# a EPH_MEM_REVOKE event or the consumer of the donated memory
+# releasing it.
+#
+# @path: path in the QOM tree to the memory object that the capacity
+#    is being returned to.
+#
+# @size: the amount of memory that is being returned, in bytes.
+#
+# @id: identifier used to connect the EPH_MEM_REVOKE event with the
+#    eph-mem-return-capacity command.  If this command is unrelated
+#    to a previous EPH_MEM_REVOKE event, this value will not be used.
+#
+##
+{ 'command': 'eph-mem-return-capacity',
+  'data': { 'path': 'str', 'size': 'uint64', '*id': 'int' }
+}

@@ -2,6 +2,7 @@ system_ss.add([files(
   'cryptodev-builtin.c',
   'cryptodev-hmp-cmds.c',
   'cryptodev.c',
+  'eph-mem.c',
   'hostmem-ram.c',
   'hostmem.c',
   'rng-builtin.c',

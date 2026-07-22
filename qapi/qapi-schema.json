@@ -75,4 +75,5 @@
 { 'include': 'vfio.json' }
 { 'include': 'cryptodev.json' }
 { 'include': 'cxl.json' }
+{ 'include': 'eph-mem.json' }
 { 'include': 'uefi.json' }
