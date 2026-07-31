@@ -270,6 +270,37 @@ int uffd_copy_page(int uffd_fd, void *dst_addr, void *src_addr,
 }
 
 /**
+ * uffd_poison_page: poison a range of pages via UFFD-IO
+ *
+ * Poison a range of pages to indicate that they are no longer valid.
+ *
+ * Returns 0 on success, -errno in case of an error
+ *
+ * @uffd_fd: UFFD file descriptor
+ * @addr: base address
+ * @length: length of the range to poison
+ * @dont_wake: do not wake threads waiting on the poisoned page
+ */
+int uffd_poison_page(int uffd_fd, void *addr, uint64_t length, bool dont_wake)
+{
+    struct uffdio_poison uffd_poison;
+
+    uffd_poison.range.start = (uintptr_t) addr;
+    uffd_poison.range.len = length;
+    uffd_poison.mode = dont_wake ? UFFDIO_POISON_MODE_DONTWAKE : 0;
+
+    if (ioctl(uffd_fd, UFFDIO_POISON, &uffd_poison)) {
+        int e = errno;
+        error_report("uffd_poison_page() failed: addr=%p length=%" PRIu64
+                " mode=%" PRIx64 " errno=%i", addr, length,
+                (uint64_t) uffd_poison.mode, e);
+        return -e;
+    }
+
+    return 0;
+}
+
+/**
  * uffd_zero_page: fill range of pages with zeroes via UFFD-IO
  *
  * Fill range pages with zeroes to resolve missing page fault within the range.

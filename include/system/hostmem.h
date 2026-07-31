@@ -18,6 +18,7 @@
 #include "qom/object.h"
 #include "system/memory.h"
 #include "qemu/bitmap.h"
+#include "qemu/thread.h"
 #include "qemu/thread-context.h"
 
 #define TYPE_MEMORY_BACKEND "memory-backend"
@@ -88,6 +89,7 @@ struct HostMemoryBackend {
     /* protected */
     uint64_t size;
     uint64_t donated_size;
+    uint64_t faulted_size;
     bool merge, dump, use_canonical_path;
     bool prealloc, donatable, is_mapped, share, reserve;
     bool guest_memfd, aligned;
@@ -95,6 +97,13 @@ struct HostMemoryBackend {
     ThreadContext *prealloc_context;
     DECLARE_BITMAP(host_nodes, MAX_NODES + 1);
     HostMemPolicy policy;
+    int userfault_fd;
+    int userfault_event_fd;
+    bool userfault_thread_exit;
+    QemuThread userfault_thread;
+    QemuMutex userfault_mutex;
+    QemuCond userfault_cond;
+    char *userfault_path;
 
     MemoryRegion mr;
 };

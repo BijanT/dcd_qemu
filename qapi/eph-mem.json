@@ -36,7 +36,8 @@
 ##
 { 'command': 'eph-mem-donate-capacity',
   'data': { 'path': 'str', 'size': 'uint64' },
-  'returns': 'EphMemDonateResult'
+  'returns': 'EphMemDonateResult',
+  'if': 'CONFIG_LINUX'
 }
 
 ##
@@ -55,7 +56,8 @@
 #
 ##
 { 'event': 'EPH_MEM_REVOKE',
-  'data': { 'path': 'str', 'size': 'uint64', 'id': 'int' }
+  'data': { 'path': 'str', 'size': 'uint64', 'id': 'int' },
+  'if': 'CONFIG_LINUX'
 }
 
 ##
@@ -77,5 +79,6 @@
 #
 ##
 { 'command': 'eph-mem-return-capacity',
-  'data': { 'path': 'str', 'size': 'uint64', '*id': 'int' }
+  'data': { 'path': 'str', 'size': 'uint64', '*id': 'int' },
+  'if': 'CONFIG_LINUX'
 }

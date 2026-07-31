@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "system/hostmem.h"
+#include "system/eph-mem.h"
 #include "system/ramblock.h"
 #include "hw/core/boards.h"
 #include "qapi/error.h"
@@ -292,11 +293,23 @@ static void host_memory_backend_init(Object *obj)
     backend->guest_memfd = machine_require_guest_memfd(machine);
     backend->reserve = true;
     backend->prealloc_threads = machine->smp.cpus;
+    backend->userfault_fd = -1;
+    backend->userfault_event_fd = -1;
+    backend->userfault_thread_exit = false;
 }
 
 static void host_memory_backend_post_init(Object *obj)
 {
     object_apply_compat_props(obj);
+}
+
+static void host_memory_backend_finalize(Object *obj)
+{
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+
+    if (backend->donatable) {
+        eph_mem_backend_finalize(backend);
+    }
 }
 
 bool host_memory_backend_mr_inited(HostMemoryBackend *backend)
@@ -361,6 +374,7 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
             return;
         }
     }
+
     if (!bc->alloc) {
         return;
     }
@@ -450,6 +464,12 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
                                                 backend->prealloc_context,
                                                 async, errp)) {
         return;
+    }
+
+    if (backend->donatable) {
+        if (eph_mem_backend_init(backend, errp)) {
+            return;
+        }
     }
 }
 
@@ -633,6 +653,7 @@ static const TypeInfo host_memory_backend_info = {
     .instance_size = sizeof(HostMemoryBackend),
     .instance_init = host_memory_backend_init,
     .instance_post_init = host_memory_backend_post_init,
+    .instance_finalize = host_memory_backend_finalize,
     .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
         { }

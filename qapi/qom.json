@@ -685,7 +685,7 @@
             '*prealloc': 'bool',
             '*prealloc-threads': 'uint32',
             '*prealloc-context': 'str',
-            '*donatable': 'bool',
+            '*donatable': { 'type': 'bool', 'if': 'CONFIG_LINUX' },
             '*share': 'bool',
             '*reserve': 'bool',
             'size': 'size',
