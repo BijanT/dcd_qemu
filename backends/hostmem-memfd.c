@@ -137,6 +137,7 @@ memfd_backend_class_init(ObjectClass *oc, const void *data)
 {
     HostMemoryBackendClass *bc = MEMORY_BACKEND_CLASS(oc);
 
+    bc->supports_donation = true;
     bc->alloc = memfd_backend_memory_alloc;
 
     if (qemu_memfd_check(MFD_HUGETLB)) {
