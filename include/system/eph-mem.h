@@ -5,7 +5,7 @@
 #include "qapi/error.h"
 #include "qemu/units.h"
 
-#define EPH_MEM_DONATION_GRANULARITY ((uint64_t)256 * MiB)
+#define EPH_MEM_DONATION_GRANULARITY ((int64_t)256 * MiB)
 
 #ifdef CONFIG_LINUX
 

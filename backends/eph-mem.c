@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/aio.h"
 #include "qemu/error-report.h"
 #include "qemu/lockable.h"
 #include "qemu/main-loop.h"
@@ -14,6 +15,11 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+
+typedef struct EphMemBHRevokeData {
+    char *backend_path;
+    uint64_t size;
+} EphMemBHRevokeData;
 
 static void *eph_mem_zero_page = NULL;
 
@@ -37,7 +43,7 @@ static int eph_mem_uffd_copy(int uffd_fd, void *dst_addr, void *src_addr,
     return 0;
 }
 
-static void eph_mem_revoke_memory(HostMemoryBackend *backend, uint64_t size)
+static void eph_mem_revoke_memory(const char *backend_path, uint64_t size)
 {
     static uint64_t next_id = 1;
     uint64_t id;
@@ -47,7 +53,7 @@ static void eph_mem_revoke_memory(HostMemoryBackend *backend, uint64_t size)
     }
 
     id = qatomic_fetch_inc(&next_id);
-    qapi_event_send_eph_mem_revoke(backend->userfault_path, size, id);
+    qapi_event_send_eph_mem_revoke(backend_path, size, id);
 }
 
 static HostMemoryBackend *eph_mem_backend_from_path(const char *path,
@@ -84,6 +90,15 @@ static HostMemoryBackend *eph_mem_backend_from_path(const char *path,
     return backend;
 }
 
+static void eph_mem_revoke_memory_bh(void *opaque)
+{
+    EphMemBHRevokeData *data = opaque;
+
+    eph_mem_revoke_memory(data->backend_path, data->size);
+    g_free(data->backend_path);
+    g_free(data);
+}
+
 /* Called with backend->userfault_mutex held */
 static bool eph_mem_handler_live(HostMemoryBackend *backend, Error **errp)
 {
@@ -95,6 +110,12 @@ static bool eph_mem_handler_live(HostMemoryBackend *backend, Error **errp)
     }
 
     return true;
+}
+
+/* Callers must hold backend->userfault_mutex */
+static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
+{
+    return backend->donated_size + backend->faulted_size;
 }
 
 /* Inspired by postcopy_ram_fault_thread */
@@ -154,9 +175,12 @@ static void *eph_mem_fault_thread(void *opaque)
         }
 
         if (pollfds[0].revents & POLLIN) {
+            EphMemBHRevokeData *revoke_data;
             struct uffd_msg msg;
             uintptr_t aligned_addr;
             uint64_t used_size;
+            int64_t headroom;
+            uint64_t size_to_revoke;
             ssize_t nread;
             bool warned = false;
 
@@ -187,12 +211,29 @@ static void *eph_mem_fault_thread(void *opaque)
 
             qemu_mutex_lock(&backend->userfault_mutex);
             /* Do we have enough memory to satisfy the request? */
-            used_size = backend->donated_size + backend->faulted_size
-                + pagesize;
+            used_size = eph_mem_get_used_size(backend) + pagesize;
             /*
-             * TODO: We should send out an EPH_MEM_REVOKE event well before
-             * we get here.
+             * Try to always have at least EPH_MEM_DONATION_GRANULARITY of
+             * headroom, including the revocation requests in flight.
              */
+            headroom = backend->size + backend->revoked_size - used_size;
+            size_to_revoke = MIN(EPH_MEM_DONATION_GRANULARITY,
+                backend->donated_size - backend->revoked_size);
+            if (headroom <= EPH_MEM_DONATION_GRANULARITY
+                && size_to_revoke > 0) {
+                backend->revoked_size += size_to_revoke;
+
+                /*
+                 * Defer sending to another thread so we don't block the
+                 * userfault handler
+                 */
+                revoke_data = g_new(EphMemBHRevokeData, 1);
+                revoke_data->backend_path = g_strdup(backend->userfault_path);
+                revoke_data->size = size_to_revoke;
+                aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                    eph_mem_revoke_memory_bh, revoke_data);
+            }
+
             while (used_size > backend->size) {
                 if (backend->userfault_thread_exit) {
                     qemu_mutex_unlock(&backend->userfault_mutex);
@@ -206,8 +247,7 @@ static void *eph_mem_fault_thread(void *opaque)
                                 backend->userfault_path);
                     warned = true;
                 }
-                used_size = backend->donated_size + backend->faulted_size
-                    + pagesize;
+                used_size = eph_mem_get_used_size(backend) + pagesize;
             }
             backend->faulted_size += pagesize;
             qemu_mutex_unlock(&backend->userfault_mutex);
@@ -239,15 +279,20 @@ retry:
 unregister:
     qemu_mutex_lock(&backend->userfault_mutex);
     backend->userfault_thread_exit = true;
-    donated_size = backend->donated_size;
+    donated_size = backend->donated_size - backend->revoked_size;
+    backend->revoked_size += donated_size;
     qemu_mutex_unlock(&backend->userfault_mutex);
+
     /*
      * Since we can no longer process userfaults, revoke the memory.
+     * We can directly call eph_mem_revoke_memory() here instead of using
+     * aio_bh_schedule_oneshot() since we are no longer processing userfault
+     * events, so there's no blocking concern.
      * TODO: Might want to separate out error case where the donor VM still
      * might need the memory vs. the shutdown case where the donor VM no longer
      * needs the memory.
      */
-    eph_mem_revoke_memory(backend, donated_size);
+    eph_mem_revoke_memory(backend->userfault_path, donated_size);
     uffd_unregister_memory(backend->userfault_fd, ptr, sz);
     rcu_unregister_thread();
     return NULL;
@@ -406,6 +451,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
 {
     HostMemoryBackend *backend;
     EphMemDonateResult *result;
+    uint64_t donated_size = 0;
     uint64_t remaining_size;
 
     if (size == 0) {
@@ -415,7 +461,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
 
     if (!QEMU_IS_ALIGNED(size, EPH_MEM_DONATION_GRANULARITY)) {
         error_setg(errp, "Donation size %" PRIu64 " is not a multiple of the "
-                   "donation granularity %" PRIu64,
+                   "donation granularity %" PRIi64,
                    size, EPH_MEM_DONATION_GRANULARITY);
         return NULL;
     }
@@ -429,20 +475,31 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
         if (!eph_mem_handler_live(backend, errp)) {
             return NULL;
         }
+        /* If a revocation request is in flight, don't allow new donations */
+        if (backend->revoked_size > 0) {
+            donated_size = 0;
+            break;
+        }
         /*
          * Only whole blocks can be granted, so a backend whose size is not a
          * multiple of the granularity keeps a permanently undonatable tail.
+         * Also, make sure we have at least EPH_MEM_DONATION_GRANULARITY of
+         * headroom.
          */
-        remaining_size = backend->size - backend->donated_size
-            - backend->faulted_size;
+        remaining_size = backend->size - eph_mem_get_used_size(backend);
         remaining_size = QEMU_ALIGN_DOWN(remaining_size,
             EPH_MEM_DONATION_GRANULARITY);
-        size = MIN(size, remaining_size);
 
-        backend->donated_size += size;
+        if (remaining_size >= EPH_MEM_DONATION_GRANULARITY) {
+            remaining_size -= EPH_MEM_DONATION_GRANULARITY;
+        }
+
+        donated_size = MIN(size, remaining_size);
+
+        backend->donated_size += donated_size;
     }
     result = g_malloc0(sizeof(*result));
-    result->granted = size;
+    result->granted = donated_size;
     return result;
 }
 
@@ -453,8 +510,7 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
 
     /*
      * TODO: If id exists, check that it matches an in flight revocation
-     * request. We do not currently issue revocation requests, so there is
-     * currently nothing to check.
+     * request.
      */
 
     if (size == 0) {
@@ -464,7 +520,7 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
 
     if (!QEMU_IS_ALIGNED(size, EPH_MEM_DONATION_GRANULARITY)) {
         error_setg(errp, "Returned size %" PRIu64 " is not a multiple of the "
-                   "donation granularity %" PRIu64,
+                   "donation granularity %" PRIi64,
                    size, EPH_MEM_DONATION_GRANULARITY);
         return;
     }
@@ -475,6 +531,14 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
     }
 
     WITH_QEMU_LOCK_GUARD(&backend->userfault_mutex) {
+        /*
+         * We don't check eph_mem_handler_live() here because when the fault
+         * thread exits on error, it revokes all the remaining donated memory.
+         * We still want to account for the orchestrator's reply here.
+         * Backends torn down via finalize are freed first, so responses from
+         * those revocation requests will never reach here.
+         */
+
         if (size > backend->donated_size) {
             error_setg(errp, "Cannot return %" PRIu64 " bytes from memory "
                        "backend '%s' at %s. Has donated %" PRIu64 " bytes",
@@ -484,6 +548,11 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
         }
 
         backend->donated_size -= size;
+        /*
+         * We could get returned capacity not related to revocation requests,
+         * so make sure we don't underflow backend->revoked_size
+         */
+        backend->revoked_size -= MIN(size, backend->revoked_size);
         qemu_cond_broadcast(&backend->userfault_cond);
     }
 }
