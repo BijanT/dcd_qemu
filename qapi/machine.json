@@ -876,6 +876,9 @@
 # @donatable: whether memory can be donated to be used as ephemeral
 #     memory
 #
+# @use-userfaultfd: whether to use userfaultfd to track memory usage.
+#     Only meaningful when donatable is true.
+#
 # @share: whether memory is private to QEMU or shared (since 6.1)
 #
 # @reserve: whether swap space (or huge pages) was reserved if
@@ -898,6 +901,7 @@
     'dump':       'bool',
     'prealloc':   'bool',
     '*donatable': 'bool',
+    '*use-userfaultfd': 'bool',
     'share':      'bool',
     '*reserve':    'bool',
     'host-nodes': ['uint16'],

@@ -654,6 +654,9 @@
 #     ephemeral memory.  Incompatible with 'reserve=on' or
 #     'prealloc=on' (default: false)
 #
+# @use-userfaultfd: if true, use userfaultfd to track memory
+#     usage.  Only meaningful when donatable is true (default: true)
+#
 # @share: if false, the memory is private to QEMU; if true, it is
 #     shared (default false for backends memory-backend-file and
 #     memory-backend-ram, true for backends memory-backend-epc,
@@ -686,6 +689,7 @@
             '*prealloc-threads': 'uint32',
             '*prealloc-context': 'str',
             '*donatable': { 'type': 'bool', 'if': 'CONFIG_LINUX' },
+            '*use-userfaultfd': { 'type': 'bool', 'if': 'CONFIG_LINUX' },
             '*share': 'bool',
             '*reserve': 'bool',
             'size': 'size',

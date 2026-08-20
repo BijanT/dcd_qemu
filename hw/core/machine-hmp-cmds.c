@@ -132,6 +132,10 @@ void hmp_info_memdev(Monitor *mon, const QDict *qdict)
             monitor_printf(mon, "  donatable: %s\n",
                            m->value->donatable ? "true" : "false");
         }
+        if (m->value->has_use_userfaultfd) {
+            monitor_printf(mon, "  use-userfaultfd: %s\n",
+                           m->value->use_userfaultfd ? "true" : "false");
+        }
         if (m->value->has_reserve) {
             monitor_printf(mon, "  reserve: %s\n",
                            m->value->reserve ? "true" : "false");

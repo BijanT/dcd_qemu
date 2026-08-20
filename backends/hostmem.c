@@ -292,6 +292,7 @@ static void host_memory_backend_init(Object *obj)
     backend->dump = machine_dump_guest_core(machine);
     backend->guest_memfd = machine_require_guest_memfd(machine);
     backend->reserve = true;
+    backend->use_userfaultfd = true;
     backend->prealloc_threads = machine->smp.cpus;
     backend->userfault_fd = -1;
     backend->userfault_event_fd = -1;
@@ -371,6 +372,10 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
         if (backend->reserve) {
             error_setg(errp,
                        "'donatable=on' and 'reserve=on' are incompatible");
+            return;
+        }
+        if (!backend->use_userfaultfd) {
+            error_setg(errp, "'use-userfaultfd=off' is not yet supported");
             return;
         }
     }
@@ -522,6 +527,26 @@ static void host_memory_backend_set_donatable(Object *obj, bool value,
     backend->donatable = value;
 }
 
+static bool host_memory_backend_get_use_userfaultfd(Object *obj, Error **errp)
+{
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+
+    return backend->use_userfaultfd;
+}
+
+static void host_memory_backend_set_use_userfaultfd(Object *obj, bool value,
+    Error **errp)
+{
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+
+    if (host_memory_backend_mr_inited(backend)) {
+        error_setg(errp, "cannot change property value");
+        return;
+    }
+
+    backend->use_userfaultfd = value;
+}
+
 static bool host_memory_backend_get_reserve(Object *o, Error **errp)
 {
     HostMemoryBackend *backend = MEMORY_BACKEND(o);
@@ -624,6 +649,12 @@ host_memory_backend_class_init(ObjectClass *oc, const void *data)
         host_memory_backend_set_donatable);
     object_class_property_set_description(oc, "donatable",
         "If true, the memory can be donated to be used as ephemeral memory");
+    object_class_property_add_bool(oc, "use-userfaultfd",
+        host_memory_backend_get_use_userfaultfd,
+        host_memory_backend_set_use_userfaultfd);
+    object_class_property_set_description(oc, "use-userfaultfd",
+        "If true, use userfaultfd to track memory usage. Only valid when "
+        "donatable is true.");
     object_class_property_add_bool(oc, "reserve",
         host_memory_backend_get_reserve, host_memory_backend_set_reserve);
     object_class_property_set_description(oc, "reserve",

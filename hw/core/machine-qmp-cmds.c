@@ -217,6 +217,13 @@ static int query_memdev(Object *obj, void *opaque)
         } else {
             m->has_donatable = true;
         }
+        m->use_userfaultfd = object_property_get_bool(obj, "use-userfaultfd",
+            &err);
+        if (err) {
+            error_free_or_abort(&err);
+        } else {
+            m->has_use_userfaultfd = true;
+        }
         m->share = object_property_get_bool(obj, "share", &error_abort);
         m->reserve = object_property_get_bool(obj, "reserve", &err);
         if (err) {

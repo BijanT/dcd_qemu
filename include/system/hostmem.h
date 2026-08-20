@@ -93,6 +93,7 @@ struct HostMemoryBackend {
     uint64_t faulted_size;
     bool merge, dump, use_canonical_path;
     bool prealloc, donatable, is_mapped, share, reserve;
+    bool use_userfaultfd;
     bool guest_memfd, aligned;
     uint32_t prealloc_threads;
     ThreadContext *prealloc_context;
