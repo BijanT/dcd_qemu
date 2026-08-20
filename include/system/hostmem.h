@@ -102,9 +102,9 @@ struct HostMemoryBackend {
     int userfault_event_fd;
     bool userfault_thread_exit;
     QemuThread userfault_thread;
-    QemuMutex userfault_mutex;
-    QemuCond userfault_cond;
-    char *userfault_path;
+    QemuMutex donatable_mutex;
+    QemuCond donatable_cond;
+    char *canonical_path;
 
     MemoryRegion mr;
 };

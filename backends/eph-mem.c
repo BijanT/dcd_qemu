@@ -99,20 +99,20 @@ static void eph_mem_revoke_memory_bh(void *opaque)
     g_free(data);
 }
 
-/* Called with backend->userfault_mutex held */
+/* Called with backend->donatable_mutex held */
 static bool eph_mem_handler_live(HostMemoryBackend *backend, Error **errp)
 {
     if (backend->userfault_thread_exit) {
         error_setg(errp, "Memory backend '%s' at %s is being torn down",
                    object_get_typename(OBJECT(backend)),
-                   backend->userfault_path);
+                   backend->canonical_path);
         return false;
     }
 
     return true;
 }
 
-/* Callers must hold backend->userfault_mutex */
+/* Callers must hold backend->donatable_mutex */
 static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
 {
     return backend->donated_size + backend->faulted_size;
@@ -209,7 +209,7 @@ static void *eph_mem_fault_thread(void *opaque)
             /* Handle the page fault */
             aligned_addr = ROUND_DOWN(msg.arg.pagefault.address, pagesize);
 
-            qemu_mutex_lock(&backend->userfault_mutex);
+            qemu_mutex_lock(&backend->donatable_mutex);
             /* Do we have enough memory to satisfy the request? */
             used_size = eph_mem_get_used_size(backend) + pagesize;
             /*
@@ -228,7 +228,7 @@ static void *eph_mem_fault_thread(void *opaque)
                  * userfault handler
                  */
                 revoke_data = g_new(EphMemBHRevokeData, 1);
-                revoke_data->backend_path = g_strdup(backend->userfault_path);
+                revoke_data->backend_path = g_strdup(backend->canonical_path);
                 revoke_data->size = size_to_revoke;
                 aio_bh_schedule_oneshot(qemu_get_aio_context(),
                     eph_mem_revoke_memory_bh, revoke_data);
@@ -236,21 +236,21 @@ static void *eph_mem_fault_thread(void *opaque)
 
             while (used_size > backend->size) {
                 if (backend->userfault_thread_exit) {
-                    qemu_mutex_unlock(&backend->userfault_mutex);
+                    qemu_mutex_unlock(&backend->donatable_mutex);
                     goto unregister;
                 }
 
                 /* Wait for memory to be returned */
-                if (!qemu_cond_timedwait(&backend->userfault_cond,
-                    &backend->userfault_mutex, 1000) && !warned) {
+                if (!qemu_cond_timedwait(&backend->donatable_cond,
+                    &backend->donatable_mutex, 1000) && !warned) {
                     warn_report("%s: waiting for memory to be returned",
-                                backend->userfault_path);
+                                backend->canonical_path);
                     warned = true;
                 }
                 used_size = eph_mem_get_used_size(backend) + pagesize;
             }
             backend->faulted_size += pagesize;
-            qemu_mutex_unlock(&backend->userfault_mutex);
+            qemu_mutex_unlock(&backend->donatable_mutex);
 
             retries = 0;
 retry:
@@ -269,19 +269,19 @@ retry:
                                  (void *)aligned_addr, strerror(-ret));
                     goto unregister;
                 }
-                qemu_mutex_lock(&backend->userfault_mutex);
+                qemu_mutex_lock(&backend->donatable_mutex);
                 backend->faulted_size -= pagesize;
-                qemu_mutex_unlock(&backend->userfault_mutex);
+                qemu_mutex_unlock(&backend->donatable_mutex);
             }
         }
     }
 
 unregister:
-    qemu_mutex_lock(&backend->userfault_mutex);
+    qemu_mutex_lock(&backend->donatable_mutex);
     backend->userfault_thread_exit = true;
     donated_size = backend->donated_size - backend->revoked_size;
     backend->revoked_size += donated_size;
-    qemu_mutex_unlock(&backend->userfault_mutex);
+    qemu_mutex_unlock(&backend->donatable_mutex);
 
     /*
      * Since we can no longer process userfaults, revoke the memory.
@@ -292,7 +292,7 @@ unregister:
      * might need the memory vs. the shutdown case where the donor VM no longer
      * needs the memory.
      */
-    eph_mem_revoke_memory(backend->userfault_path, donated_size);
+    eph_mem_revoke_memory(backend->canonical_path, donated_size);
     uffd_unregister_memory(backend->userfault_fd, ptr, sz);
     rcu_unregister_thread();
     return NULL;
@@ -349,8 +349,8 @@ int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
         goto enable_discard;
     }
 
-    backend->userfault_path = object_get_canonical_path(OBJECT(backend));
-    if (!backend->userfault_path) {
+    backend->canonical_path = object_get_canonical_path(OBJECT(backend));
+    if (!backend->canonical_path) {
         error_setg(errp, "Failed to get canonical path for memory backend");
         goto cleanup_uffd;
     }
@@ -388,16 +388,16 @@ int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
         goto cleanup_path;
     }
 
-    qemu_mutex_init(&backend->userfault_mutex);
-    qemu_cond_init(&backend->userfault_cond);
+    qemu_mutex_init(&backend->donatable_mutex);
+    qemu_cond_init(&backend->donatable_cond);
 
     qemu_thread_create(&backend->userfault_thread, "eph-mem-fault",
                        eph_mem_fault_thread, backend, QEMU_THREAD_JOINABLE);
 
     return 0;
 cleanup_path:
-    g_free(backend->userfault_path);
-    backend->userfault_path = NULL;
+    g_free(backend->canonical_path);
+    backend->canonical_path = NULL;
 cleanup_uffd:
     close(backend->userfault_fd);
     backend->userfault_fd = -1;
@@ -426,17 +426,17 @@ void eph_mem_backend_finalize(HostMemoryBackend *backend)
     }
 
     /* First, end the fault thread to make sure it's done working */
-    qemu_mutex_lock(&backend->userfault_mutex);
+    qemu_mutex_lock(&backend->donatable_mutex);
     backend->userfault_thread_exit = true;
-    qemu_cond_broadcast(&backend->userfault_cond);
-    qemu_mutex_unlock(&backend->userfault_mutex);
+    qemu_cond_broadcast(&backend->donatable_cond);
+    qemu_mutex_unlock(&backend->donatable_mutex);
     eph_mem_notify_fault_thread(backend);
     qemu_thread_join(&backend->userfault_thread);
-    g_free(backend->userfault_path);
-    backend->userfault_path = NULL;
+    g_free(backend->canonical_path);
+    backend->canonical_path = NULL;
 
-    qemu_mutex_destroy(&backend->userfault_mutex);
-    qemu_cond_destroy(&backend->userfault_cond);
+    qemu_mutex_destroy(&backend->donatable_mutex);
+    qemu_cond_destroy(&backend->donatable_cond);
 
     ram_block_discard_disable(false);
 
@@ -471,7 +471,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
         return NULL;
     }
 
-    WITH_QEMU_LOCK_GUARD(&backend->userfault_mutex) {
+    WITH_QEMU_LOCK_GUARD(&backend->donatable_mutex) {
         if (!eph_mem_handler_live(backend, errp)) {
             return NULL;
         }
@@ -530,7 +530,7 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
         return;
     }
 
-    WITH_QEMU_LOCK_GUARD(&backend->userfault_mutex) {
+    WITH_QEMU_LOCK_GUARD(&backend->donatable_mutex) {
         /*
          * We don't check eph_mem_handler_live() here because when the fault
          * thread exits on error, it revokes all the remaining donated memory.
@@ -553,6 +553,6 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
          * so make sure we don't underflow backend->revoked_size
          */
         backend->revoked_size -= MIN(size, backend->revoked_size);
-        qemu_cond_broadcast(&backend->userfault_cond);
+        qemu_cond_broadcast(&backend->donatable_cond);
     }
 }
