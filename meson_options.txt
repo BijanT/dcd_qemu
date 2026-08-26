@@ -152,6 +152,8 @@ option('blkio', type : 'feature', value : 'auto',
        description: 'libblkio block device driver')
 option('bpf', type : 'feature', value : 'auto',
         description: 'eBPF support')
+option('bpf_fault', type : 'feature', value : 'auto',
+        description: 'eBPF fault injection support with ebpf')
 option('cocoa', type : 'feature', value : 'auto',
        description: 'Cocoa user interface (macOS only)')
 option('curl', type : 'feature', value : 'auto',

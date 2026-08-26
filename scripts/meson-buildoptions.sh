@@ -100,6 +100,7 @@ meson_options_help() {
   printf "%s\n" '  blkio           libblkio block device driver'
   printf "%s\n" '  bochs           bochs image format support'
   printf "%s\n" '  bpf             eBPF support'
+  printf "%s\n" '  bpf-fault       eBPF fault injection support with ebpf'
   printf "%s\n" '  brlapi          brlapi character device driver'
   printf "%s\n" '  bzip2           bzip2 support for DMG images'
   printf "%s\n" '  canokey         CanoKey support'
@@ -261,6 +262,8 @@ _meson_option_parse() {
     --disable-bochs) printf "%s" -Dbochs=disabled ;;
     --enable-bpf) printf "%s" -Dbpf=enabled ;;
     --disable-bpf) printf "%s" -Dbpf=disabled ;;
+    --enable-bpf-fault) printf "%s" -Dbpf_fault=enabled ;;
+    --disable-bpf-fault) printf "%s" -Dbpf_fault=disabled ;;
     --enable-brlapi) printf "%s" -Dbrlapi=enabled ;;
     --disable-brlapi) printf "%s" -Dbrlapi=disabled ;;
     --enable-bzip2) printf "%s" -Dbzip2=enabled ;;

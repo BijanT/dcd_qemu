@@ -2261,6 +2261,20 @@ if libbpf.found() and not cc.links('''
   endif
 endif
 
+bpf_fault = not_found
+if libbpf.found() and not get_option('bpf_fault').disabled()
+  if cc.links('''
+    #include <bpf/libbpf.h>
+    int main(void) {
+      bpf_map__attach_fault_ops(NULL, NULL, 0, 0);
+      return 0;
+    }''', dependencies: libbpf)
+    bpf_fault = libbpf
+  elif get_option('bpf_fault').enabled()
+    error('bpf_fault requested but this libbpf lacks bpf-fault support')
+  endif
+endif
+
 # libxdp
 libxdp = not_found
 if not get_option('af_xdp').auto() or have_system
@@ -2480,6 +2494,7 @@ config_host_data.set('CONFIG_HEXAGON_IDEF_PARSER', get_option('hexagon_idef_pars
 config_host_data.set('CONFIG_LIBATTR', have_old_libattr)
 config_host_data.set('CONFIG_LIBCAP_NG', libcap_ng.found())
 config_host_data.set('CONFIG_EBPF', libbpf.found())
+config_host_data.set('CONFIG_BPF_FAULT', bpf_fault.found())
 config_host_data.set('CONFIG_AF_XDP', libxdp.found())
 config_host_data.set('CONFIG_LIBDAXCTL', libdaxctl.found())
 config_host_data.set('CONFIG_LIBISCSI', libiscsi.found())
