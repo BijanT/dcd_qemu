@@ -3,6 +3,11 @@ SKELETONS = rss.bpf.skeleton.h bpf_fault.bpf.skeleton.h
 LLVM_STRIP ?= llvm-strip
 CLANG ?= clang
 INC_FLAGS = `$(CLANG) -print-file-name=include`
+# clang -target bpf drops the host's native include search path (e.g. the
+# /usr/include/<multiarch> dir Debian/Ubuntu keep asm/types.h etc. under), so
+# re-inject the native clang's default search path here.
+CLANG_BPF_SYS_INCLUDES ?= $(shell $(CLANG) -v -E - </dev/null 2>&1 \
+	| sed -n '/<...> search starts here:/,/End of search list/{ s| \(/.*\)|-idirafter \1|p }')
 EXTRA_CFLAGS ?= -O2 -g -target bpf
 
 all: $(SKELETONS)
@@ -13,7 +18,7 @@ clean:
 	rm -f $(SKELETONS) $(SKELETONS:%.skeleton.h=%.o)
 
 %.o: %.c
-	$(CLANG) $(INC_FLAGS) \
+	$(CLANG) $(INC_FLAGS) $(CLANG_BPF_SYS_INCLUDES) \
 		-mcpu=v3 \
                 -D__KERNEL__ -D__ASM_SYSREG_H \
                 -I../include $(LINUXINCLUDE) \
