@@ -89,8 +89,18 @@ struct HostMemoryBackend {
 
     /* protected */
     uint64_t size;
+    /* Never mutated in eBPF, so using QEMU mutex is sufficient. */
     uint64_t *donated_size;
+    /*
+     * Mutated in both eBPF and QEMU, so a QEMU mutex will not guarantee mutual
+     * exclusion when using eBPF.
+     */
     uint64_t *revoked_size;
+    /*
+     * Only mutated in eBPF in bpf mode, so single atomic reads are sufficient.
+     * In userfaultfd mode, this is mutated only in the fault thread, so using
+     * a mutex or atomic reads is sufficient.
+     */
     uint64_t *faulted_size;
     bool merge, dump, use_canonical_path;
     bool prealloc, donatable, is_mapped, share, reserve;

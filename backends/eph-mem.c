@@ -117,7 +117,8 @@ static bool eph_mem_handler_live(HostMemoryBackend *backend, Error **errp)
 /* Callers must hold backend->donatable_mutex */
 static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
 {
-    return *backend->donated_size + *backend->faulted_size;
+    return qatomic_read(backend->donated_size)
+        + qatomic_read(backend->faulted_size);
 }
 
 /* Inspired by postcopy_ram_fault_thread */
@@ -481,6 +482,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
     EphMemDonateResult *result;
     uint64_t donated_size = 0;
     uint64_t remaining_size;
+    uint64_t used_size;
 
     if (size == 0) {
         error_setg(errp, "Cannot donate zero bytes");
@@ -504,7 +506,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
             return NULL;
         }
         /* If a revocation request is in flight, don't allow new donations */
-        if (*backend->revoked_size > 0) {
+        if (qatomic_read(backend->revoked_size) > 0) {
             donated_size = 0;
             break;
         }
@@ -514,7 +516,9 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
          * Also, make sure we have at least EPH_MEM_DONATION_GRANULARITY of
          * headroom.
          */
-        remaining_size = backend->size - eph_mem_get_used_size(backend);
+        used_size = eph_mem_get_used_size(backend);
+        remaining_size = backend->size >= used_size ?
+            backend->size - used_size : 0;
         remaining_size = QEMU_ALIGN_DOWN(remaining_size,
             EPH_MEM_DONATION_GRANULARITY);
 
@@ -524,7 +528,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
 
         donated_size = MIN(size, remaining_size);
 
-        *backend->donated_size += donated_size;
+        qatomic_add(backend->donated_size, donated_size);
     }
     result = g_malloc0(sizeof(*result));
     result->granted = donated_size;
@@ -535,6 +539,9 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
     int64_t id, Error **errp)
 {
     HostMemoryBackend *backend;
+    uint64_t old_revoked_size;
+    uint64_t new_revoked_size;
+    uint64_t cmpxchg_ret;
 
     /*
      * TODO: If id exists, check that it matches an in flight revocation
@@ -567,20 +574,27 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
          * those revocation requests will never reach here.
          */
 
-        if (size > *backend->donated_size) {
+        if (size > qatomic_read(backend->donated_size)) {
             error_setg(errp, "Cannot return %" PRIu64 " bytes from memory "
                        "backend '%s' at %s. Has donated %" PRIu64 " bytes",
                        size, object_get_typename(OBJECT(backend)), path,
-                       *backend->donated_size);
+                       qatomic_read(backend->donated_size));
             return;
         }
 
-        *backend->donated_size -= size;
+        qatomic_sub(backend->donated_size, size);
         /*
          * We could get returned capacity not related to revocation requests,
-         * so make sure we don't underflow backend->revoked_size
+         * so make sure we don't underflow backend->revoked_size.
+         * Do compare-and-swap loop even under lock since the eBPF program
+         * doesn't abide by the lock.
          */
-        *backend->revoked_size -= MIN(size, *backend->revoked_size);
+        do {
+            old_revoked_size = qatomic_read(backend->revoked_size);
+            new_revoked_size = old_revoked_size - MIN(size, old_revoked_size);
+            cmpxchg_ret = qatomic_cmpxchg(backend->revoked_size, old_revoked_size,
+                new_revoked_size);
+        } while (cmpxchg_ret != old_revoked_size);
         qemu_cond_broadcast(&backend->donatable_cond);
     }
 }
