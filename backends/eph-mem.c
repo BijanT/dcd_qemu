@@ -13,7 +13,6 @@
 #include "qapi/error.h"
 
 #include <poll.h>
-#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 
 typedef struct EphMemBHRevokeData {
@@ -104,7 +103,7 @@ static void eph_mem_revoke_memory_bh(void *opaque)
 /* Called with backend->donatable_mutex held */
 static bool eph_mem_handler_live(HostMemoryBackend *backend, Error **errp)
 {
-    if (backend->userfault_thread_exit) {
+    if (backend->donatable_thread_exit) {
         error_setg(errp, "Memory backend '%s' at %s is being torn down",
                    object_get_typename(OBJECT(backend)),
                    backend->canonical_path);
@@ -121,6 +120,48 @@ static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
         + qatomic_read(backend->faulted_size);
 }
 
+static int eph_mem_wait_for_return(HostMemoryBackend *backend)
+{
+    struct pollfd pollfds[2];
+    int ret;
+
+    pollfds[0].fd = event_notifier_get_fd(&backend->donatable_return_notifier);
+    pollfds[0].events = POLLIN;
+    pollfds[1].fd = event_notifier_get_fd(&backend->donatable_exit_notifier);
+    pollfds[1].events = POLLIN;
+
+    ret = poll(pollfds, 2, -1);
+    if (ret < 0) {
+        if (errno == EINTR) {
+            return 0;
+        }
+        error_report("poll failed: %s", strerror(errno));
+        return -1;
+    }
+
+    /*
+     * These are unlikely to occur. Just do a cursory check.
+     */
+    if ((pollfds[0].revents | pollfds[1].revents) &
+        (POLLERR | POLLHUP | POLLNVAL)) {
+        error_report("Unexpected poll revents: %d %d",
+                     pollfds[0].revents, pollfds[1].revents);
+        return -1;
+    }
+
+    /*
+     * We don't have to do anything but consume the events here. The caller
+     * will check the state on return and take appropriate action.
+     */
+    if (pollfds[0].revents & POLLIN) {
+        event_notifier_test_and_clear(&backend->donatable_return_notifier);
+    }
+    if (pollfds[1].revents & POLLIN) {
+        event_notifier_test_and_clear(&backend->donatable_exit_notifier);
+    }
+    return 0;
+}
+
 /* Inspired by postcopy_ram_fault_thread */
 static void *eph_mem_fault_thread(void *opaque)
 {
@@ -132,7 +173,6 @@ static void *eph_mem_fault_thread(void *opaque)
     uint64_t sz;
     uint64_t donated_size;
     int ret;
-    uint64_t tmp;
     int retries;
 
     rcu_register_thread();
@@ -143,7 +183,7 @@ static void *eph_mem_fault_thread(void *opaque)
 
     pollfds[0].fd = backend->userfault_fd;
     pollfds[0].events = POLLIN;
-    pollfds[1].fd = backend->userfault_event_fd;
+    pollfds[1].fd = event_notifier_get_fd(&backend->donatable_exit_notifier);
     pollfds[1].events = POLLIN;
 
     while (true) {
@@ -157,12 +197,7 @@ static void *eph_mem_fault_thread(void *opaque)
         }
 
         if (pollfds[1].revents & POLLIN) {
-            /* Consume the signal */
-            ret = read(backend->userfault_event_fd, &tmp, sizeof(tmp));
-            if (ret != sizeof(tmp)) {
-                error_report("Failed to read from userfault eventfd: %d",
-                             ret < 0 ? -errno : ret);
-            }
+            event_notifier_test_and_clear(&backend->donatable_exit_notifier);
             /* Eventfd was signaled, time to exit */
             break;
         }
@@ -238,18 +273,27 @@ static void *eph_mem_fault_thread(void *opaque)
             }
 
             while (used_size > backend->size) {
-                if (backend->userfault_thread_exit) {
-                    qemu_mutex_unlock(&backend->donatable_mutex);
-                    goto unregister;
-                }
-
-                /* Wait for memory to be returned */
-                if (!qemu_cond_timedwait(&backend->donatable_cond,
-                    &backend->donatable_mutex, 1000) && !warned) {
+                if (!warned) {
                     warn_report("%s: waiting for memory to be returned",
                                 backend->canonical_path);
                     warned = true;
                 }
+
+                qemu_mutex_unlock(&backend->donatable_mutex);
+                /*
+                 * Must drop the lock here since qmp_eph_mem_return_capacity
+                 * takes it
+                 */
+                if (eph_mem_wait_for_return(backend)) {
+                    goto unregister;
+                }
+                qemu_mutex_lock(&backend->donatable_mutex);
+
+                if (backend->donatable_thread_exit) {
+                    qemu_mutex_unlock(&backend->donatable_mutex);
+                    goto unregister;
+                }
+
                 used_size = eph_mem_get_used_size(backend) + pagesize;
             }
             *backend->faulted_size += pagesize;
@@ -281,7 +325,7 @@ retry:
 
 unregister:
     qemu_mutex_lock(&backend->donatable_mutex);
-    backend->userfault_thread_exit = true;
+    backend->donatable_thread_exit = true;
     donated_size = *backend->donated_size - *backend->revoked_size;
     *backend->revoked_size += donated_size;
     qemu_mutex_unlock(&backend->donatable_mutex);
@@ -353,12 +397,6 @@ static int eph_mem_userfaultfd_init(HostMemoryBackend *backend, Error **errp)
         goto cleanup_uffd;
     }
 
-    backend->userfault_event_fd = eventfd(0, EFD_CLOEXEC);
-    if (backend->userfault_event_fd == -1) {
-        error_setg_errno(errp, errno, "Failed to create userfault eventfd");
-        goto cleanup_uffd;
-    }
-
     backend->revoked_size = g_new0(uint64_t, 1);
     backend->donated_size = g_new0(uint64_t, 1);
     backend->faulted_size = g_new0(uint64_t, 1);
@@ -408,34 +446,37 @@ int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
         goto enable_discard;
     }
 
+    if (event_notifier_init(&backend->donatable_exit_notifier, 0)) {
+        error_setg(errp, "Failed to initialize donatable exit event notifier");
+        goto cleanup_path;
+    }
+
+    if (event_notifier_init(&backend->donatable_return_notifier, 0)) {
+        error_setg(errp,
+            "Failed to initialize donatable return event notifier");
+        goto cleanup_exit_notifier;
+    }
+
     qemu_mutex_init(&backend->donatable_mutex);
-    qemu_cond_init(&backend->donatable_cond);
 
     if (backend->use_userfaultfd) {
         if (eph_mem_userfaultfd_init(backend, errp)) {
-            goto cleanup_path;
+            goto cleanup_return_notifier;
         }
     }
 
     return 0;
+cleanup_return_notifier:
+    qemu_mutex_destroy(&backend->donatable_mutex);
+    event_notifier_cleanup(&backend->donatable_return_notifier);
+cleanup_exit_notifier:
+    event_notifier_cleanup(&backend->donatable_exit_notifier);
 cleanup_path:
     g_free(backend->canonical_path);
     backend->canonical_path = NULL;
 enable_discard:
     ram_block_discard_disable(false);
     return -1;
-}
-
-static void eph_mem_notify_fault_thread(HostMemoryBackend *backend)
-{
-    uint64_t tmp = 1;
-    ssize_t nwrite;
-
-    nwrite = write(backend->userfault_event_fd, &tmp, sizeof(tmp));
-    if (nwrite != sizeof(tmp)) {
-        error_report("Failed to notify fault thread: %s",
-                     nwrite < 0 ? strerror(errno) : "short write");
-    }
 }
 
 void eph_mem_backend_finalize(HostMemoryBackend *backend)
@@ -448,10 +489,9 @@ void eph_mem_backend_finalize(HostMemoryBackend *backend)
     /* First, end the fault thread to make sure it's done working */
     if (backend->use_userfaultfd) {
         qemu_mutex_lock(&backend->donatable_mutex);
-        backend->userfault_thread_exit = true;
-        qemu_cond_broadcast(&backend->donatable_cond);
+        backend->donatable_thread_exit = true;
         qemu_mutex_unlock(&backend->donatable_mutex);
-        eph_mem_notify_fault_thread(backend);
+        event_notifier_set(&backend->donatable_exit_notifier);
         qemu_thread_join(&backend->userfault_thread);
 
         g_free(backend->revoked_size);
@@ -462,15 +502,15 @@ void eph_mem_backend_finalize(HostMemoryBackend *backend)
         backend->faulted_size = NULL;
 
         close(backend->userfault_fd);
-        close(backend->userfault_event_fd);
         backend->userfault_fd = -1;
-        backend->userfault_event_fd = -1;
     }
     g_free(backend->canonical_path);
     backend->canonical_path = NULL;
 
     qemu_mutex_destroy(&backend->donatable_mutex);
-    qemu_cond_destroy(&backend->donatable_cond);
+
+    event_notifier_cleanup(&backend->donatable_exit_notifier);
+    event_notifier_cleanup(&backend->donatable_return_notifier);
 
     ram_block_discard_disable(false);
 }
@@ -595,6 +635,6 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
             cmpxchg_ret = qatomic_cmpxchg(backend->revoked_size, old_revoked_size,
                 new_revoked_size);
         } while (cmpxchg_ret != old_revoked_size);
-        qemu_cond_broadcast(&backend->donatable_cond);
+        event_notifier_set(&backend->donatable_return_notifier);
     }
 }

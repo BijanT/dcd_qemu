@@ -18,6 +18,7 @@
 #include "qom/object.h"
 #include "system/memory.h"
 #include "qemu/bitmap.h"
+#include "qemu/event_notifier.h"
 #include "qemu/thread.h"
 #include "qemu/thread-context.h"
 #include "ebpf/ebpf_bpf_fault.h"
@@ -111,11 +112,11 @@ struct HostMemoryBackend {
     DECLARE_BITMAP(host_nodes, MAX_NODES + 1);
     HostMemPolicy policy;
     int userfault_fd;
-    int userfault_event_fd;
-    bool userfault_thread_exit;
+    EventNotifier donatable_exit_notifier;
+    EventNotifier donatable_return_notifier;
+    bool donatable_thread_exit;
     QemuThread userfault_thread;
     QemuMutex donatable_mutex;
-    QemuCond donatable_cond;
     EBPFFaultContext bpf_fault_ctx;
     char *canonical_path;
 

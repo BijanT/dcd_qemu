@@ -295,8 +295,7 @@ static void host_memory_backend_init(Object *obj)
     backend->use_userfaultfd = true;
     backend->prealloc_threads = machine->smp.cpus;
     backend->userfault_fd = -1;
-    backend->userfault_event_fd = -1;
-    backend->userfault_thread_exit = false;
+    backend->donatable_thread_exit = false;
 }
 
 static void host_memory_backend_post_init(Object *obj)
