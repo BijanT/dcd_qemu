@@ -20,6 +20,7 @@
 #include "qemu/bitmap.h"
 #include "qemu/thread.h"
 #include "qemu/thread-context.h"
+#include "ebpf/ebpf_bpf_fault.h"
 
 #define TYPE_MEMORY_BACKEND "memory-backend"
 OBJECT_DECLARE_TYPE(HostMemoryBackend, HostMemoryBackendClass,
@@ -88,9 +89,9 @@ struct HostMemoryBackend {
 
     /* protected */
     uint64_t size;
-    uint64_t donated_size;
-    uint64_t revoked_size;
-    uint64_t faulted_size;
+    uint64_t *donated_size;
+    uint64_t *revoked_size;
+    uint64_t *faulted_size;
     bool merge, dump, use_canonical_path;
     bool prealloc, donatable, is_mapped, share, reserve;
     bool use_userfaultfd;
@@ -105,6 +106,7 @@ struct HostMemoryBackend {
     QemuThread userfault_thread;
     QemuMutex donatable_mutex;
     QemuCond donatable_cond;
+    EBPFFaultContext bpf_fault_ctx;
     char *canonical_path;
 
     MemoryRegion mr;

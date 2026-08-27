@@ -21,6 +21,8 @@ typedef struct EphMemBHRevokeData {
     uint64_t size;
 } EphMemBHRevokeData;
 
+#define MAX_PAGESIZE (2 * MiB)
+
 static void *eph_mem_zero_page = NULL;
 
 static int eph_mem_uffd_copy(int uffd_fd, void *dst_addr, void *src_addr,
@@ -43,7 +45,7 @@ static int eph_mem_uffd_copy(int uffd_fd, void *dst_addr, void *src_addr,
     return 0;
 }
 
-static void eph_mem_revoke_memory(const char *backend_path, uint64_t size)
+void eph_mem_revoke_memory(const char *backend_path, uint64_t size)
 {
     static uint64_t next_id = 1;
     uint64_t id;
@@ -115,7 +117,7 @@ static bool eph_mem_handler_live(HostMemoryBackend *backend, Error **errp)
 /* Callers must hold backend->donatable_mutex */
 static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
 {
-    return backend->donated_size + backend->faulted_size;
+    return *backend->donated_size + *backend->faulted_size;
 }
 
 /* Inspired by postcopy_ram_fault_thread */
@@ -216,12 +218,12 @@ static void *eph_mem_fault_thread(void *opaque)
              * Try to always have at least EPH_MEM_DONATION_GRANULARITY of
              * headroom, including the revocation requests in flight.
              */
-            headroom = backend->size + backend->revoked_size - used_size;
+            headroom = backend->size + *backend->revoked_size - used_size;
             size_to_revoke = MIN(EPH_MEM_DONATION_GRANULARITY,
-                backend->donated_size - backend->revoked_size);
+                *backend->donated_size - *backend->revoked_size);
             if (headroom <= EPH_MEM_DONATION_GRANULARITY
                 && size_to_revoke > 0) {
-                backend->revoked_size += size_to_revoke;
+                *backend->revoked_size += size_to_revoke;
 
                 /*
                  * Defer sending to another thread so we don't block the
@@ -249,7 +251,7 @@ static void *eph_mem_fault_thread(void *opaque)
                 }
                 used_size = eph_mem_get_used_size(backend) + pagesize;
             }
-            backend->faulted_size += pagesize;
+            *backend->faulted_size += pagesize;
             qemu_mutex_unlock(&backend->donatable_mutex);
 
             retries = 0;
@@ -270,7 +272,7 @@ retry:
                     goto unregister;
                 }
                 qemu_mutex_lock(&backend->donatable_mutex);
-                backend->faulted_size -= pagesize;
+                *backend->faulted_size -= pagesize;
                 qemu_mutex_unlock(&backend->donatable_mutex);
             }
         }
@@ -279,8 +281,8 @@ retry:
 unregister:
     qemu_mutex_lock(&backend->donatable_mutex);
     backend->userfault_thread_exit = true;
-    donated_size = backend->donated_size - backend->revoked_size;
-    backend->revoked_size += donated_size;
+    donated_size = *backend->donated_size - *backend->revoked_size;
+    *backend->revoked_size += donated_size;
     qemu_mutex_unlock(&backend->donatable_mutex);
 
     /*
@@ -298,21 +300,13 @@ unregister:
     return NULL;
 }
 
-int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
+static int eph_mem_userfaultfd_init(HostMemoryBackend *backend, Error **errp)
 {
-    const size_t MAX_PAGESIZE = 2 * MiB;
     struct uffdio_api api_struct = {0};
     struct uffdio_register reg_struct;
     uint64_t ioctl_mask;
     void *ptr;
     uint64_t sz;
-    size_t pagesize = host_memory_backend_pagesize(backend);
-
-    if (pagesize > MAX_PAGESIZE) {
-        error_setg(errp, "Page size %zu is larger than the maximum supported "
-                   "page size %zu", pagesize, MAX_PAGESIZE);
-        return -1;
-    }
 
     if (!eph_mem_zero_page) {
         eph_mem_zero_page = qemu_ram_mmap(-1, MAX_PAGESIZE, MAX_PAGESIZE,
@@ -322,6 +316,71 @@ int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
             eph_mem_zero_page = NULL;
             return -1;
         }
+    }
+
+    backend->userfault_fd = uffd_open(O_CLOEXEC | O_NONBLOCK);
+    if (backend->userfault_fd < 0) {
+        backend->userfault_fd = -1;
+        error_setg_errno(errp, errno, "Userfaultfd not available");
+        return -1;
+    }
+
+    api_struct.api = UFFD_API;
+    api_struct.features = 0;
+    if (ioctl(backend->userfault_fd, UFFDIO_API, &api_struct)) {
+        error_setg_errno(errp, errno, "UFFDIO_API failed");
+        goto cleanup_uffd;
+    }
+    ioctl_mask = 1ULL << _UFFDIO_REGISTER | 1ULL << _UFFDIO_UNREGISTER;
+    if ((api_struct.ioctls & ioctl_mask) != ioctl_mask) {
+        error_setg(errp, "Missing userfault features: %" PRIx64,
+                   (uint64_t)(~api_struct.ioctls & ioctl_mask));
+        goto cleanup_uffd;
+    }
+
+    ptr = memory_region_get_ram_ptr(&backend->mr);
+    sz = memory_region_size(&backend->mr);
+    reg_struct.range.start = (uintptr_t)ptr;
+    reg_struct.range.len = sz;
+    reg_struct.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (ioctl(backend->userfault_fd, UFFDIO_REGISTER, &reg_struct)) {
+        error_setg_errno(errp, errno, "UFFDIO_REGISTER failed");
+        goto cleanup_uffd;
+    }
+    if (!(reg_struct.ioctls & (1ULL << _UFFDIO_COPY))) {
+        error_setg(errp, "Region doesn't support COPY");
+        goto cleanup_uffd;
+    }
+
+    backend->userfault_event_fd = eventfd(0, EFD_CLOEXEC);
+    if (backend->userfault_event_fd == -1) {
+        error_setg_errno(errp, errno, "Failed to create userfault eventfd");
+        goto cleanup_uffd;
+    }
+
+    backend->revoked_size = g_new0(uint64_t, 1);
+    backend->donated_size = g_new0(uint64_t, 1);
+    backend->faulted_size = g_new0(uint64_t, 1);
+
+    qemu_thread_create(&backend->userfault_thread, "eph-mem-fault",
+                       eph_mem_fault_thread, backend, QEMU_THREAD_JOINABLE);
+
+    return 0;
+
+cleanup_uffd:
+    close(backend->userfault_fd);
+    backend->userfault_fd = -1;
+    return -1;
+}
+
+int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
+{
+    size_t pagesize = host_memory_backend_pagesize(backend);
+
+    if (pagesize > MAX_PAGESIZE) {
+        error_setg(errp, "Page size %zu is larger than the maximum supported "
+                   "page size %zu", pagesize, MAX_PAGESIZE);
+        return -1;
     }
 
     if (!QEMU_IS_ALIGNED(backend->size, pagesize)) {
@@ -342,65 +401,25 @@ int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
         return -1;
     }
 
-    backend->userfault_fd = uffd_open(O_CLOEXEC | O_NONBLOCK);
-    if (backend->userfault_fd < 0) {
-        backend->userfault_fd = -1;
-        error_setg_errno(errp, errno, "Userfaultfd not available");
-        goto enable_discard;
-    }
-
     backend->canonical_path = object_get_canonical_path(OBJECT(backend));
     if (!backend->canonical_path) {
         error_setg(errp, "Failed to get canonical path for memory backend");
-        goto cleanup_uffd;
-    }
-
-    api_struct.api = UFFD_API;
-    api_struct.features = 0;
-    if (ioctl(backend->userfault_fd, UFFDIO_API, &api_struct)) {
-        error_setg_errno(errp, errno, "UFFDIO_API failed");
-        goto cleanup_path;
-    }
-    ioctl_mask = 1ULL << _UFFDIO_REGISTER | 1ULL << _UFFDIO_UNREGISTER;
-    if ((api_struct.ioctls & ioctl_mask) != ioctl_mask) {
-        error_setg(errp, "Missing userfault features: %" PRIx64,
-                   (uint64_t)(~api_struct.ioctls & ioctl_mask));
-        goto cleanup_path;
-    }
-
-    ptr = memory_region_get_ram_ptr(&backend->mr);
-    sz = memory_region_size(&backend->mr);
-    reg_struct.range.start = (uintptr_t)ptr;
-    reg_struct.range.len = sz;
-    reg_struct.mode = UFFDIO_REGISTER_MODE_MISSING;
-    if (ioctl(backend->userfault_fd, UFFDIO_REGISTER, &reg_struct)) {
-        error_setg_errno(errp, errno, "UFFDIO_REGISTER failed");
-        goto cleanup_path;
-    }
-    if (!(reg_struct.ioctls & (1ULL << _UFFDIO_COPY))) {
-        error_setg(errp, "Region doesn't support COPY");
-        goto cleanup_path;
-    }
-
-    backend->userfault_event_fd = eventfd(0, EFD_CLOEXEC);
-    if (backend->userfault_event_fd == -1) {
-        error_setg_errno(errp, errno, "Failed to create userfault eventfd");
-        goto cleanup_path;
+        goto enable_discard;
     }
 
     qemu_mutex_init(&backend->donatable_mutex);
     qemu_cond_init(&backend->donatable_cond);
 
-    qemu_thread_create(&backend->userfault_thread, "eph-mem-fault",
-                       eph_mem_fault_thread, backend, QEMU_THREAD_JOINABLE);
+    if (backend->use_userfaultfd) {
+        if (eph_mem_userfaultfd_init(backend, errp)) {
+            goto cleanup_path;
+        }
+    }
 
     return 0;
 cleanup_path:
     g_free(backend->canonical_path);
     backend->canonical_path = NULL;
-cleanup_uffd:
-    close(backend->userfault_fd);
-    backend->userfault_fd = -1;
 enable_discard:
     ram_block_discard_disable(false);
     return -1;
@@ -426,12 +445,26 @@ void eph_mem_backend_finalize(HostMemoryBackend *backend)
     }
 
     /* First, end the fault thread to make sure it's done working */
-    qemu_mutex_lock(&backend->donatable_mutex);
-    backend->userfault_thread_exit = true;
-    qemu_cond_broadcast(&backend->donatable_cond);
-    qemu_mutex_unlock(&backend->donatable_mutex);
-    eph_mem_notify_fault_thread(backend);
-    qemu_thread_join(&backend->userfault_thread);
+    if (backend->use_userfaultfd) {
+        qemu_mutex_lock(&backend->donatable_mutex);
+        backend->userfault_thread_exit = true;
+        qemu_cond_broadcast(&backend->donatable_cond);
+        qemu_mutex_unlock(&backend->donatable_mutex);
+        eph_mem_notify_fault_thread(backend);
+        qemu_thread_join(&backend->userfault_thread);
+
+        g_free(backend->revoked_size);
+        g_free(backend->donated_size);
+        g_free(backend->faulted_size);
+        backend->revoked_size = NULL;
+        backend->donated_size = NULL;
+        backend->faulted_size = NULL;
+
+        close(backend->userfault_fd);
+        close(backend->userfault_event_fd);
+        backend->userfault_fd = -1;
+        backend->userfault_event_fd = -1;
+    }
     g_free(backend->canonical_path);
     backend->canonical_path = NULL;
 
@@ -439,11 +472,6 @@ void eph_mem_backend_finalize(HostMemoryBackend *backend)
     qemu_cond_destroy(&backend->donatable_cond);
 
     ram_block_discard_disable(false);
-
-    close(backend->userfault_fd);
-    close(backend->userfault_event_fd);
-    backend->userfault_fd = -1;
-    backend->userfault_event_fd = -1;
 }
 
 EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
@@ -476,7 +504,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
             return NULL;
         }
         /* If a revocation request is in flight, don't allow new donations */
-        if (backend->revoked_size > 0) {
+        if (*backend->revoked_size > 0) {
             donated_size = 0;
             break;
         }
@@ -496,7 +524,7 @@ EphMemDonateResult *qmp_eph_mem_donate_capacity(const char *path, uint64_t size,
 
         donated_size = MIN(size, remaining_size);
 
-        backend->donated_size += donated_size;
+        *backend->donated_size += donated_size;
     }
     result = g_malloc0(sizeof(*result));
     result->granted = donated_size;
@@ -539,20 +567,20 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
          * those revocation requests will never reach here.
          */
 
-        if (size > backend->donated_size) {
+        if (size > *backend->donated_size) {
             error_setg(errp, "Cannot return %" PRIu64 " bytes from memory "
                        "backend '%s' at %s. Has donated %" PRIu64 " bytes",
                        size, object_get_typename(OBJECT(backend)), path,
-                       backend->donated_size);
+                       *backend->donated_size);
             return;
         }
 
-        backend->donated_size -= size;
+        *backend->donated_size -= size;
         /*
          * We could get returned capacity not related to revocation requests,
          * so make sure we don't underflow backend->revoked_size
          */
-        backend->revoked_size -= MIN(size, backend->revoked_size);
+        *backend->revoked_size -= MIN(size, *backend->revoked_size);
         qemu_cond_broadcast(&backend->donatable_cond);
     }
 }

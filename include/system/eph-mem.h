@@ -11,6 +11,7 @@
 
 int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp);
 void eph_mem_backend_finalize(HostMemoryBackend *backend);
+void eph_mem_revoke_memory(const char *backend_path, uint64_t size);
 
 #else
 
@@ -20,6 +21,10 @@ static inline int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
 }
 
 static inline void eph_mem_backend_finalize(HostMemoryBackend *backend)
+{
+}
+
+static inline void eph_mem_revoke_memory(const char *backend_path, uint64_t size)
 {
 }
 
