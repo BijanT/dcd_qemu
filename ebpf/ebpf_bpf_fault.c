@@ -1,5 +1,6 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "hw/core/boards.h"
 #include "system/hostmem.h"
 #include "system/eph-mem.h"
 
@@ -12,7 +13,14 @@
 static int handle_revoke_event(void *ctx, void *data, size_t data_sz)
 {
     HostMemoryBackend *backend = ctx;
-    uint64_t size_to_revoke = *(uint64_t *)data;
+    uint64_t size_to_revoke;
+
+    if (data_sz != sizeof(size_to_revoke)) {
+        error_report("handle_revoke_event: Expected data size of %zu, got %zu",
+            sizeof(size_to_revoke), data_sz);
+        return 0;
+    }
+    size_to_revoke = *(uint64_t *)data;
 
     eph_mem_revoke_memory(backend->canonical_path, size_to_revoke);
     return 0;
@@ -42,29 +50,36 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
     struct bpf_link *link = NULL;
     void *backend_ptr = memory_region_get_ram_ptr(&backend->mr);
     uint64_t backend_size = memory_region_size(&backend->mr);
-    int ret;
 
     g_assert(!ebpf_fault_is_loaded(ctx));
 
     bpf_fault_ctx = bpf_fault_bpf__open();
     if (!bpf_fault_ctx) {
-	error_setg(errp, "Unable to open eBPF program");
-	return false;
+        error_setg(errp, "Unable to open eBPF program");
+        return false;
     }
 
+    /* This shouldn't happen, but guard with a reasonably large value in case */
+    if (!current_machine || !current_machine->smp.max_cpus) {
+        warn_report("Failed to retrieve max_cpus from current machine, using "
+            "default value of 128");
+        bpf_fault_ctx->rodata->num_vcpus = 128;
+    } else {
+        bpf_fault_ctx->rodata->num_vcpus = current_machine->smp.max_cpus;
+    }
     bpf_fault_ctx->rodata->backend_size = backend_size;
     ctx->obj = bpf_fault_ctx;
 
     if (bpf_fault_bpf__load(ctx->obj)) {
-	error_setg(errp, "Unable to load eBPF program");
-	goto error;
+        error_setg(errp, "Unable to load eBPF program");
+        goto error;
     }
 
     rb = ring_buffer__new(bpf_map__fd(bpf_fault_ctx->maps.revoke_event_rb),
     	handle_revoke_event, backend, NULL);
     if (!rb) {
-	error_setg(errp, "Unable to create ring buffer");
-	goto error;
+        error_setg(errp, "Unable to create ring buffer");
+        goto error;
     }
     ctx->rb = rb;
     ctx->epoll_fd = ring_buffer__epoll_fd(rb);
@@ -74,17 +89,11 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
     backend->donated_size = (uint64_t *)&bpf_fault_ctx->bss->donated_size;
     backend->faulted_size = (uint64_t *)&bpf_fault_ctx->bss->faulted_size;
 
-    ret = bpf_fault_bpf__attach(bpf_fault_ctx);
-    if (ret) {
-	error_setg(errp, "Unable to attach eBPF program");
-	goto error;
-    }
-
     link = bpf_map__attach_fault_ops(bpf_fault_ctx->maps.fault_ops,
         backend_ptr, backend_size, 0);
     if (!link) {
-	error_setg(errp, "Unable to setup bpf fault ops");
-	goto error;
+        error_setg(errp, "Unable to setup bpf fault ops");
+        goto error;
     }
     ctx->bpf_link = link;
 
