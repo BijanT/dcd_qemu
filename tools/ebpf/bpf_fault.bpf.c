@@ -24,6 +24,8 @@
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+char LICENSE[] SEC("license") = "GPL";
+
 /*
  * Declare bpf_fault types here instead of getting them from vmlinux.h to allow
  * building this on a machine without the bpf_fault kernel.
