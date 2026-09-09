@@ -22,6 +22,7 @@ struct bpf_fault_ops_ctx;
 struct fault_ops {
     int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx, unsigned char *buf);
     int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx, unsigned char *buf);
+    void (*handle_fork)(struct bpf_fault_ops_ctx *ctx);
 };
 
 struct {
@@ -200,4 +201,5 @@ SEC(".struct_ops.link")
 struct fault_ops fault_ops = {
     .handle_page_fault = (void *)handle_page_fault,
     .handle_wp_fault = NULL,
+    .handle_fork = NULL,
 };
