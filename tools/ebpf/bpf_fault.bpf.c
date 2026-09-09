@@ -51,8 +51,8 @@ struct revoke_state {
     __u64 size_to_revoke;
 };
 
-const __u64 num_vcpus = 0;
-const __u64 backend_size = 0;
+volatile const __u64 num_vcpus = 0;
+volatile const __u64 backend_size = 0;
 volatile __u64 donated_size = 0;
 volatile __u64 revoked_size = 0;
 volatile __u64 faulted_size = 0;
