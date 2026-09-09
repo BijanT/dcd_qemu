@@ -57,6 +57,12 @@ void eph_mem_revoke_memory(const char *backend_path, uint64_t size)
     qapi_event_send_eph_mem_revoke(backend_path, size, id);
 }
 
+static bool eph_mem_is_initialized(HostMemoryBackend *backend)
+{
+    return backend->userfault_fd != -1 ||
+           ebpf_fault_is_loaded(&backend->bpf_fault_ctx);
+}
+
 static HostMemoryBackend *eph_mem_backend_from_path(const char *path,
     Error **errp)
 {
@@ -81,7 +87,7 @@ static HostMemoryBackend *eph_mem_backend_from_path(const char *path,
                    object_get_typename(OBJECT(backend)), path);
         return NULL;
     }
-    if (backend->userfault_fd == -1) {
+    if (!eph_mem_is_initialized(backend)) {
         error_setg(errp, "Memory backend '%s' at %s is not initialized for "
                    "ephemeral memory",
                    object_get_typename(OBJECT(backend)), path);
@@ -162,8 +168,30 @@ static int eph_mem_wait_for_return(HostMemoryBackend *backend)
     return 0;
 }
 
+static void eph_mem_thread_cleanup(HostMemoryBackend *backend)
+{
+    uint64_t donated_size;
+    qemu_mutex_lock(&backend->donatable_mutex);
+    backend->donatable_thread_exit = true;
+    donated_size = qatomic_read(backend->donated_size)
+        - qatomic_read(backend->revoked_size);
+    qatomic_add(backend->revoked_size, donated_size);
+    qemu_mutex_unlock(&backend->donatable_mutex);
+
+    /*
+     * Since we can no longer process userfaults, revoke the memory.
+     * We can directly call eph_mem_revoke_memory() here instead of using
+     * aio_bh_schedule_oneshot() since we are no longer processing userfault
+     * events, so there's no blocking concern.
+     * TODO: Might want to separate out error case where the donor VM still
+     * might need the memory vs. the shutdown case where the donor VM no longer
+     * needs the memory.
+     */
+    eph_mem_revoke_memory(backend->canonical_path, donated_size);
+}
+
 /* Inspired by postcopy_ram_fault_thread */
-static void *eph_mem_fault_thread(void *opaque)
+static void *eph_mem_userfault_thread(void *opaque)
 {
     const int EPH_MEM_COPY_MAX_RETRIES = 3;
     HostMemoryBackend *backend = opaque;
@@ -171,7 +199,6 @@ static void *eph_mem_fault_thread(void *opaque)
     size_t pagesize;
     void *ptr;
     uint64_t sz;
-    uint64_t donated_size;
     int ret;
     int retries;
 
@@ -324,24 +351,115 @@ retry:
     }
 
 unregister:
-    qemu_mutex_lock(&backend->donatable_mutex);
-    backend->donatable_thread_exit = true;
-    donated_size = *backend->donated_size - *backend->revoked_size;
-    *backend->revoked_size += donated_size;
-    qemu_mutex_unlock(&backend->donatable_mutex);
-
-    /*
-     * Since we can no longer process userfaults, revoke the memory.
-     * We can directly call eph_mem_revoke_memory() here instead of using
-     * aio_bh_schedule_oneshot() since we are no longer processing userfault
-     * events, so there's no blocking concern.
-     * TODO: Might want to separate out error case where the donor VM still
-     * might need the memory vs. the shutdown case where the donor VM no longer
-     * needs the memory.
-     */
-    eph_mem_revoke_memory(backend->canonical_path, donated_size);
+    eph_mem_thread_cleanup(backend);
     uffd_unregister_memory(backend->userfault_fd, ptr, sz);
     rcu_unregister_thread();
+    return NULL;
+}
+
+static void *eph_mem_bpf_fault_thread(void *opaque)
+{
+    HostMemoryBackend *backend = opaque;
+    EBPFFaultContext *ctx = &backend->bpf_fault_ctx;
+    uint64_t num_vcpus = ctx->num_vcpus;
+    uint64_t headroom_buffer_size = num_vcpus * ctx->page_size;
+    uint64_t backend_size = backend->size;
+    uint64_t used_size;
+    struct pollfd pollfds[3];
+
+    /* Notifier to revoke memory */
+    pollfds[0].fd = backend->bpf_fault_ctx.epoll_fd;
+    pollfds[0].events = POLLIN;
+    /* Notifier that a thread is waiting on bpf-fault */
+    pollfds[1].fd = backend->bpf_fault_ctx.link_fd;
+    pollfds[1].events = POLLIN;
+    /* Notifier for signalling exit */
+    pollfds[2].fd = event_notifier_get_fd(&backend->donatable_exit_notifier);
+    pollfds[2].events = POLLIN;
+
+    while (true) {
+        int ret = poll(pollfds, 3, -1);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error_report("poll failed: %s", strerror(errno));
+            break;
+        }
+
+        if (pollfds[2].revents & POLLIN) {
+            event_notifier_test_and_clear(&backend->donatable_exit_notifier);
+            /* Eventfd was signaled, time to exit */
+            break;
+        }
+
+        /*
+         * These are unlikely to occur. Just do a cursory check.
+         */
+        if ((pollfds[0].revents | pollfds[1].revents | pollfds[2].revents) &
+            (POLLERR | POLLHUP | POLLNVAL)) {
+            error_report("Unexpected poll revents: %d %d %d",
+                         pollfds[0].revents, pollfds[1].revents,
+                         pollfds[2].revents);
+            break;
+        }
+
+        if (pollfds[0].revents & POLLIN) {
+            if (ebpf_fault_consume_revoke(&backend->bpf_fault_ctx) < 0) {
+                error_report("Failed to consume revoke event");
+                break;
+            }
+        }
+
+        if (pollfds[1].revents & POLLIN) {
+            bool warned = false;
+
+            ret = ebpf_fault_consume_wait(&backend->bpf_fault_ctx, NULL);
+            if (ret < 0 && ret != -EAGAIN) {
+                error_report("Failed to consume wait event: %s",
+                             strerror(-ret));
+                break;
+            }
+            /* It's harmless to recheck the condition on -EAGAIN */
+
+            qemu_mutex_lock(&backend->donatable_mutex);
+            used_size = eph_mem_get_used_size(backend) + headroom_buffer_size;
+            qemu_mutex_unlock(&backend->donatable_mutex);
+
+            while (used_size > backend_size) {
+                if (!warned) {
+                    warned = true;
+                    warn_report("%s: waiting for memory to be returned",
+                                backend->canonical_path);
+                }
+
+                if (eph_mem_wait_for_return(backend)) {
+                    goto unregister;
+                }
+
+                WITH_QEMU_LOCK_GUARD(&backend->donatable_mutex) {
+                    if (backend->donatable_thread_exit) {
+                        goto unregister;
+                    }
+                    used_size = eph_mem_get_used_size(backend) + headroom_buffer_size;
+                }
+            }
+
+            /*
+             * We should have enough memory now. Wake up the threads to try the
+             * page fault again. We can safely wake up all waiting threads since
+             * they are all waiting on the same condition.
+             */
+            if (ebpf_fault_wake_all(ctx)) {
+                error_report("Failed to wake all waiting threads");
+                goto unregister;
+            }
+        }
+    }
+
+unregister:
+    ebpf_fault_detach(&backend->bpf_fault_ctx);
+    eph_mem_thread_cleanup(backend);
     return NULL;
 }
 
@@ -401,8 +519,8 @@ static int eph_mem_userfaultfd_init(HostMemoryBackend *backend, Error **errp)
     backend->donated_size = g_new0(uint64_t, 1);
     backend->faulted_size = g_new0(uint64_t, 1);
 
-    qemu_thread_create(&backend->userfault_thread, "eph-mem-fault",
-                       eph_mem_fault_thread, backend, QEMU_THREAD_JOINABLE);
+    qemu_thread_create(&backend->donatable_thread, "eph-mem-fault",
+                       eph_mem_userfault_thread, backend, QEMU_THREAD_JOINABLE);
 
     return 0;
 
@@ -410,6 +528,19 @@ cleanup_uffd:
     close(backend->userfault_fd);
     backend->userfault_fd = -1;
     return -1;
+}
+
+static int eph_mem_bpf_fault_init(HostMemoryBackend *backend, Error **errp)
+{
+    ebpf_fault_init(&backend->bpf_fault_ctx);
+    if (!ebpf_fault_load(&backend->bpf_fault_ctx, backend, errp)) {
+        return -1;
+    }
+
+    qemu_thread_create(&backend->donatable_thread, "eph-mem-fault",
+                       eph_mem_bpf_fault_thread, backend, QEMU_THREAD_JOINABLE);
+
+    return 0;
 }
 
 int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
@@ -463,6 +594,10 @@ int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
         if (eph_mem_userfaultfd_init(backend, errp)) {
             goto cleanup_return_notifier;
         }
+    } else {
+        if (eph_mem_bpf_fault_init(backend, errp)) {
+            goto cleanup_return_notifier;
+        }
     }
 
     return 0;
@@ -482,18 +617,18 @@ enable_discard:
 void eph_mem_backend_finalize(HostMemoryBackend *backend)
 {
     /* Check if ephemeral memory stuff has been initialized */
-    if (backend->userfault_fd == -1) {
+    if (!eph_mem_is_initialized(backend)) {
         return;
     }
 
     /* First, end the fault thread to make sure it's done working */
-    if (backend->use_userfaultfd) {
-        qemu_mutex_lock(&backend->donatable_mutex);
-        backend->donatable_thread_exit = true;
-        qemu_mutex_unlock(&backend->donatable_mutex);
-        event_notifier_set(&backend->donatable_exit_notifier);
-        qemu_thread_join(&backend->userfault_thread);
+    qemu_mutex_lock(&backend->donatable_mutex);
+    backend->donatable_thread_exit = true;
+    qemu_mutex_unlock(&backend->donatable_mutex);
+    event_notifier_set(&backend->donatable_exit_notifier);
+    qemu_thread_join(&backend->donatable_thread);
 
+    if (backend->use_userfaultfd) {
         g_free(backend->revoked_size);
         g_free(backend->donated_size);
         g_free(backend->faulted_size);
@@ -503,6 +638,14 @@ void eph_mem_backend_finalize(HostMemoryBackend *backend)
 
         close(backend->userfault_fd);
         backend->userfault_fd = -1;
+    } else {
+        /*
+         * Take the lock here because ebpf_fault_destroy sets the revoked,
+         * faulted, and donated pointers to NULL.
+         */
+        qemu_mutex_lock(&backend->donatable_mutex);
+        ebpf_fault_destroy(&backend->bpf_fault_ctx, backend);
+        qemu_mutex_unlock(&backend->donatable_mutex);
     }
     g_free(backend->canonical_path);
     backend->canonical_path = NULL;

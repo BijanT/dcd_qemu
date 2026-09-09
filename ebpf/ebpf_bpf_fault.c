@@ -33,8 +33,16 @@ void ebpf_fault_init(struct EBPFFaultContext *ctx)
         ctx->rb = NULL;
         ctx->bpf_link = NULL;
         ctx->program_fd = -1;
+        ctx->link_fd = -1;
         ctx->epoll_fd = -1;
+        ctx->page_size = 0;
+        ctx->num_vcpus = 0;
     }
+}
+
+static bool ebpf_fault_is_attached(struct EBPFFaultContext *ctx)
+{
+    return ctx != NULL && ctx->bpf_link != NULL;
 }
 
 bool ebpf_fault_is_loaded(struct EBPFFaultContext *ctx)
@@ -50,6 +58,8 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
     struct bpf_link *link = NULL;
     void *backend_ptr = memory_region_get_ram_ptr(&backend->mr);
     uint64_t backend_size = memory_region_size(&backend->mr);
+    size_t page_size = host_memory_backend_pagesize(backend);
+    int old_link_flags;
 
     g_assert(!ebpf_fault_is_loaded(ctx));
 
@@ -63,10 +73,11 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
     if (!current_machine || !current_machine->smp.max_cpus) {
         warn_report("Failed to retrieve max_cpus from current machine, using "
             "default value of 128");
-        bpf_fault_ctx->rodata->num_vcpus = 128;
+        ctx->num_vcpus = 128;
     } else {
-        bpf_fault_ctx->rodata->num_vcpus = current_machine->smp.max_cpus;
+        ctx->num_vcpus = current_machine->smp.max_cpus;
     }
+    bpf_fault_ctx->rodata->num_vcpus = ctx->num_vcpus;
     bpf_fault_ctx->rodata->backend_size = backend_size;
     ctx->obj = bpf_fault_ctx;
 
@@ -96,6 +107,27 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
         goto error;
     }
     ctx->bpf_link = link;
+    ctx->link_fd = bpf_link__fd(link);
+    old_link_flags = fcntl(ctx->link_fd, F_GETFL);
+    if (old_link_flags < 0) {
+        error_setg_errno(errp, errno, "Unable to get bpf link fd flags");
+        goto error;
+    }
+    if (fcntl(ctx->link_fd, F_SETFL, old_link_flags | O_NONBLOCK)< 0) {
+        error_setg_errno(errp, errno, "Unable to set bpf link fd to non-blocking");
+        goto error;
+    }
+
+    /*
+     * TODO: Have this match the page size of the backend when we add huge page
+     * support to bpf-fault.
+     */
+    if (page_size != 4096) {
+        error_setg(errp, "eBPF fault only supports 4K pages, but backend has "
+            "page size of %zu", page_size);
+        goto error;
+    }
+    ctx->page_size = page_size;
 
     return true;
 
@@ -106,29 +138,37 @@ error:
     ctx->obj = NULL;
     ctx->rb = NULL;
     ctx->bpf_link = NULL;
+    ctx->link_fd = -1;
     ctx->program_fd = -1;
     ctx->epoll_fd = -1;
+    ctx->page_size = 0;
+    ctx->num_vcpus = 0;
     backend->revoked_size = NULL;
     backend->donated_size = NULL;
     backend->faulted_size = NULL;
     return false;
 }
 
-void ebpf_fault_unload(struct EBPFFaultContext *ctx, HostMemoryBackend *backend)
+void ebpf_fault_detach(struct EBPFFaultContext *ctx)
 {
-    if (!ebpf_fault_is_loaded(ctx)) {
+    if (!ebpf_fault_is_attached(ctx)) {
         return;
     }
 
     ring_buffer__free(ctx->rb);
     bpf_link__destroy(ctx->bpf_link);
-    bpf_fault_bpf__destroy(ctx->obj);
 
-    ctx->obj = NULL;
     ctx->rb = NULL;
     ctx->bpf_link = NULL;
-    ctx->program_fd = -1;
+    ctx->link_fd = -1;
     ctx->epoll_fd = -1;
+}
+
+void ebpf_fault_destroy(struct EBPFFaultContext *ctx, HostMemoryBackend *backend)
+{
+    bpf_fault_bpf__destroy(ctx->obj);
+    ctx->obj = NULL;
+    ctx->program_fd = -1;
 
     if (backend) {
         backend->revoked_size = NULL;
@@ -137,9 +177,40 @@ void ebpf_fault_unload(struct EBPFFaultContext *ctx, HostMemoryBackend *backend)
     }
 }
 
-int ebpf_fault_consume(struct EBPFFaultContext *ctx)
+int ebpf_fault_consume_revoke(struct EBPFFaultContext *ctx)
 {
-    g_assert(ebpf_fault_is_loaded(ctx));
+    g_assert(ebpf_fault_is_attached(ctx));
 
     return ring_buffer__consume(ctx->rb);
+}
+
+int ebpf_fault_consume_wait(struct EBPFFaultContext *ctx, uint64_t *addr)
+{
+    struct bpf_fault_msg msg;
+    int ret;
+
+    g_assert(ebpf_fault_is_attached(ctx));
+
+    ret = read(ctx->link_fd, &msg, sizeof(msg));
+    if (ret < 0) {
+        return -errno;
+    } else if (ret != sizeof(msg)) {
+        return -EIO;
+    }
+
+    if (addr) {
+        *addr = msg.address;
+    }
+    return 0;
+}
+
+int ebpf_fault_wake_all(struct EBPFFaultContext *ctx)
+{
+    g_assert(ebpf_fault_is_attached(ctx));
+
+    /*
+     * Using start = 0, len = UINT64_MAX signals to wake all waiting
+     * bpf fault threads.
+     */
+    return bpf_link__fault_wake(ctx->link_fd, 0, UINT64_MAX);
 }

@@ -373,10 +373,6 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
                        "'donatable=on' and 'reserve=on' are incompatible");
             return;
         }
-        if (!backend->use_userfaultfd) {
-            error_setg(errp, "'use-userfaultfd=off' is not yet supported");
-            return;
-        }
     }
 
     if (!bc->alloc) {

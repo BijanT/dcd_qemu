@@ -115,7 +115,7 @@ struct HostMemoryBackend {
     EventNotifier donatable_exit_notifier;
     EventNotifier donatable_return_notifier;
     bool donatable_thread_exit;
-    QemuThread userfault_thread;
+    QemuThread donatable_thread;
     QemuMutex donatable_mutex;
     EBPFFaultContext bpf_fault_ctx;
     char *canonical_path;
