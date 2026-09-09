@@ -5,6 +5,16 @@
 #include <bpf/bpf_tracing.h>
 
 #define EPH_MEM_DONATION_GRANULARITY ((__s64)256 * 1024 * 1024)
+
+#ifndef BPF_FAULT_RET_SUCCESS
+#define BPF_FAULT_RET_SUCCESS 0
+#endif
+#ifndef BPF_FAULT_RET_SIGBUS
+#define BPF_FAULT_RET_SIGBUS 1
+#endif
+#ifndef BPF_FAULT_RET_WAIT
+#define BPF_FAULT_RET_WAIT 2
+#endif
 /*
  * Give plenty of chances for CAS to succeed. It should never actually get this
  * high in practice.
@@ -191,10 +201,11 @@ int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *fctx,
      */
     bpf_loop(MAX_CAS_LOOPS, admit_fault_cas_loop, &adm_state, 0);
     if (!adm_state.admit) {
-        return -1;
+        /* We need to wait for more memory. */
+        return BPF_FAULT_RET_WAIT;
     }
 
-    return 0;
+    return BPF_FAULT_RET_SUCCESS;
 }
 
 SEC(".struct_ops.link")
