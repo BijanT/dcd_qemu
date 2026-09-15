@@ -128,9 +128,9 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
     return true;
 
 error:
-    bpf_fault_bpf__destroy(bpf_fault_ctx);
     ring_buffer__free(rb);
     bpf_link__destroy(link);
+    bpf_fault_bpf__destroy(bpf_fault_ctx);
     ctx->obj = NULL;
     ctx->rb = NULL;
     ctx->bpf_link = NULL;
