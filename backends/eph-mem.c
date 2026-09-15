@@ -532,7 +532,6 @@ cleanup_uffd:
 
 static int eph_mem_bpf_fault_init(HostMemoryBackend *backend, Error **errp)
 {
-    ebpf_fault_init(&backend->bpf_fault_ctx);
     if (!ebpf_fault_load(&backend->bpf_fault_ctx, backend, errp)) {
         return -1;
     }
@@ -546,6 +545,12 @@ static int eph_mem_bpf_fault_init(HostMemoryBackend *backend, Error **errp)
 int eph_mem_backend_init(HostMemoryBackend *backend, Error **errp)
 {
     size_t pagesize = host_memory_backend_pagesize(backend);
+
+    /*
+     * Doesn't actually set up eBPF, but sets the initial state which is needed
+     * to singal that eBPF is not set up.
+     */
+    ebpf_fault_init(&backend->bpf_fault_ctx);
 
     if (pagesize > MAX_PAGESIZE) {
         error_setg(errp, "Page size %zu is larger than the maximum supported "
