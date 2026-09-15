@@ -20,20 +20,19 @@
  * high in practice.
  */
 #define MAX_CAS_LOOPS 1000
-#define PAGE_SIZE 4096
+#define BASE_PAGE_SIZE 4096
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 char LICENSE[] SEC("license") = "GPL";
 
-/*
- * Declare bpf_fault types here instead of getting them from vmlinux.h to allow
- * building this on a machine without the bpf_fault kernel.
- */
-struct bpf_fault_ops_ctx;
+struct bpf_fault_ops_ctx {
+    __u32 page_order;
+} __attribute__((preserve_access_index));
+
 struct fault_ops {
-    int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx, unsigned char *buf);
-    int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx, unsigned char *buf);
+    int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx, struct bpf_dynptr *buf);
+    int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx, struct bpf_dynptr *buf);
     void (*handle_fork)(struct bpf_fault_ops_ctx *ctx);
 };
 
@@ -45,6 +44,7 @@ struct {
 
 struct admit_state {
     __u8 admit;
+    __u32 page_order;
 };
 
 struct revoke_state {
@@ -67,10 +67,11 @@ volatile __u64 faulted_size = 0;
 static long admit_fault_cas_loop(__u32 index, void *ctx)
 {
     struct admit_state *state = ctx;
+    __u64 page_size = BASE_PAGE_SIZE << state->page_order;
     __u64 old_faulted_size = faulted_size;
-    __u64 new_faulted_size = old_faulted_size + PAGE_SIZE;
+    __u64 new_faulted_size = old_faulted_size + page_size;
     __u64 local_donated_size = donated_size;
-    __u64 buffer_size = num_vcpus * PAGE_SIZE;
+    __u64 buffer_size = num_vcpus * page_size;
     __u64 used_size = local_donated_size + new_faulted_size;
     __u64 cas_ret;
 
@@ -104,7 +105,7 @@ static long admit_fault_cas_loop(__u32 index, void *ctx)
      * If this is the case, we should retry the CAS operation.
      */
     if (donated_size > local_donated_size) {
-        __sync_fetch_and_sub(&faulted_size, PAGE_SIZE);
+        __sync_fetch_and_sub(&faulted_size, page_size);
         state->admit = 0;
         return 0;
     }
@@ -165,10 +166,12 @@ static long revoke_cas_loop(__u32 index, void *ctx)
 
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *fctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
+    __u32 order = fctx->page_order;
     struct admit_state adm_state = {
         .admit = 0,
+        .page_order = order,
     };
     struct revoke_state rev_state = {
         .size_to_revoke = 0,

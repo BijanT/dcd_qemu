@@ -118,12 +118,8 @@ bool ebpf_fault_load(struct EBPFFaultContext *ctx, HostMemoryBackend *backend,
         goto error;
     }
 
-    /*
-     * TODO: Have this match the page size of the backend when we add huge page
-     * support to bpf-fault.
-     */
-    if (page_size != 4096) {
-        error_setg(errp, "eBPF fault only supports 4K pages, but backend has "
+    if (page_size > (2 * MiB)) {
+        error_setg(errp, "eBPF fault only supports up to 2MB pages, but backend has "
             "page size of %zu", page_size);
         goto error;
     }
