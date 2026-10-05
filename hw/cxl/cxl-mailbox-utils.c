@@ -20,11 +20,13 @@
 #include "hw/pci-bridge/cxl_downstream_port.h"
 #include "hw/pci-bridge/cxl_upstream_port.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qemu/uuid.h"
 #include "system/hostmem.h"
+#include "system/ramblock.h"
 #include "qemu/range.h"
 #include "qapi/qapi-types-cxl.h"
 #include "qapi/qapi-events-cxl.h"
@@ -3925,10 +3927,36 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
 
         CXLDCRegion *region = cxl_find_dc_region(ct3d, dpa, len);
         if (region) {
+            /* Create a new event extent */
             event_ext = g_malloc0(sizeof(*event_ext));
             event_ext->offset = dpa - region->base;
             event_ext->len = len;
             QAPI_LIST_APPEND(event_ext_list_ptr, event_ext);
+
+            /*
+             * Drop the memory backing this region if it's not reserved, since
+             * the reserved flag being set indicates that the user wants to
+             * keep the memory resident.
+             * ct3_clear_region_block_backed already clears the DC region's
+             * block bitmap, so we don't have to worry about a race condition
+             * here.
+             */
+            if (!ct3d->dc.host_dc->reserve) {
+                MemoryRegion *dcd_mr =
+                    host_memory_backend_get_memory(ct3d->dc.host_dc);
+                /*
+                 * All DC regions share the same HostMemoryBackend, so the
+                 * offset into the memory region is based on the base DPA
+                 * address of the first DC region.
+                 */
+                uint64_t mr_offset = dpa - ct3d->dc.regions[0].base;
+
+                if (ram_block_discard_range(dcd_mr->ram_block, mr_offset,
+                                            len) < 0) {
+                    warn_report("cxl-type3: Failed to discard DC range "
+                                "0x%" PRIx64 "+0x%" PRIx64, mr_offset, len);
+                }
+            }
         }
     }
     qapi_event_send_cxl_release_dynamic_capacity(object_get_canonical_path_component(OBJECT(ct3d)), event_ext_list);
