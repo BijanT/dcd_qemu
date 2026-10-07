@@ -21,7 +21,6 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "qapi/error.h"
-#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/pmem.h"
 #include "qemu/range.h"
@@ -1162,8 +1161,6 @@ void ct3_set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
             if (ct3_test_region_block_backed_inner(region, dpa, chunk_len)) {
                 int dc_alias_index = (dpa - ct3d->dc.regions[0].base) / fw->dc_alias_size;
                 memory_region_set_enabled(&fw->dc_aliases[dc_alias_index], true);
-                qemu_log("FW %d: DC alias region [0x%" PRIx64 ", 0x%" PRIx64 ") is enabled\n",
-                         fw->index, dpa, dpa + chunk_len);
             }
 
             dpa += chunk_len;
@@ -1219,8 +1216,6 @@ void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
             uint64_t chunk_len = MIN(len, fw->dc_alias_size);
             int dc_alias_index = (dpa - ct3d->dc.regions[0].base) / fw->dc_alias_size;
             memory_region_set_enabled(&fw->dc_aliases[dc_alias_index], false);
-            qemu_log("FW %d: DC alias region [0x%" PRIx64 ", 0x%" PRIx64 ") is disabled\n",
-                     fw->index, dpa, dpa + chunk_len);
 
             dpa += chunk_len;
             len -= chunk_len;
