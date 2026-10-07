@@ -3911,20 +3911,24 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
 
     /*
      * If the dry run release passes, the returned updated_list will
-     * be the updated extent list and we just need to clear the extents
-     * in the accepted list and copy extents in the updated_list to accepted
-     * list and update the extent count;
-     * Wrap this in a memory region transaction, or else many long latency
-     * transactions will be triggered needlessly.
+     * be the updated extent list. Now, we need to clear the block-backed
+     * state (bitmap and DC alias regions) for the released range, then
+     * replace the accepted list with the updated list.
+     * Wrap this in a memory region transaction, or a separate transaction
+     * commit will occur for each call to ct3_clear_region_block_backed.
      */
     memory_region_transaction_begin();
+    for (uint32_t i = 0; i < in_size; i++) {
+        uint64_t dpa = in[i].start_dpa;
+        uint64_t len = in[i].len;
+
+        ct3_clear_region_block_backed(ct3d, dpa, len);
+    }
     QTAILQ_FOREACH_SAFE(ent, &ct3d->dc.extents, node, ent_next) {
-        ct3_clear_region_block_backed(ct3d, ent->start_dpa, ent->len);
         cxl_remove_extent_from_extent_list(&ct3d->dc.extents, ent);
     }
     copy_extent_list(&ct3d->dc.extents, &updated_list);
     QTAILQ_FOREACH_SAFE(ent, &updated_list, node, ent_next) {
-        ct3_set_region_block_backed(ct3d, ent->start_dpa, ent->len);
         cxl_remove_extent_from_extent_list(&updated_list, ent);
     }
     apply_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
