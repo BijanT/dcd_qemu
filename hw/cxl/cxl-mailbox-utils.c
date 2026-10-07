@@ -3913,7 +3913,10 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
      * be the updated extent list and we just need to clear the extents
      * in the accepted list and copy extents in the updated_list to accepted
      * list and update the extent count;
+     * Wrap this in a memory region transaction, or else many long latency
+     * transactions will be triggered needlessly.
      */
+    memory_region_transaction_begin();
     QTAILQ_FOREACH_SAFE(ent, &ct3d->dc.extents, node, ent_next) {
         ct3_clear_region_block_backed(ct3d, ent->start_dpa, ent->len);
         cxl_remove_extent_from_extent_list(&ct3d->dc.extents, ent);
@@ -3923,6 +3926,7 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
         ct3_set_region_block_backed(ct3d, ent->start_dpa, ent->len);
         cxl_remove_extent_from_extent_list(&updated_list, ent);
     }
+    memory_region_transaction_commit();
     ct3d->dc.total_extent_count += (updated_list_size -
                                     ct3d->dc.nr_extents_accepted);
 
