@@ -137,6 +137,22 @@ static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
         + qatomic_read(backend->faulted_size);
 }
 
+/*
+ * Mirror admit_fault_cas_loop() in bpf_fault.bpf.c: a fault is admitted only
+ * if donated + faulted + one page (+ a per-vCPU buffer when memory has been
+ * donated) fits in the backend. Callers must hold backend->donatable_mutex.
+ */
+static uint64_t eph_mem_bpf_required_size(HostMemoryBackend *backend)
+{
+    EBPFFaultContext *ctx = &backend->bpf_fault_ctx;
+    uint64_t required = eph_mem_get_used_size(backend) + ctx->page_size;
+
+    if (qatomic_read(backend->donated_size) > 0) {
+        required += ctx->num_vcpus * ctx->page_size;
+    }
+    return required;
+}
+
 static int eph_mem_wait_for_return(HostMemoryBackend *backend)
 {
     struct pollfd pollfds[2];
@@ -379,8 +395,6 @@ static void *eph_mem_bpf_fault_thread(void *opaque)
 {
     HostMemoryBackend *backend = opaque;
     EBPFFaultContext *ctx = &backend->bpf_fault_ctx;
-    uint64_t num_vcpus = ctx->num_vcpus;
-    uint64_t headroom_buffer_size = num_vcpus * ctx->page_size;
     uint64_t backend_size = backend->size;
     uint64_t used_size;
     struct pollfd pollfds[3];
@@ -441,7 +455,7 @@ static void *eph_mem_bpf_fault_thread(void *opaque)
             /* It's harmless to recheck the condition on -EAGAIN */
 
             qemu_mutex_lock(&backend->donatable_mutex);
-            used_size = eph_mem_get_used_size(backend) + headroom_buffer_size;
+            used_size = eph_mem_bpf_required_size(backend);
             qemu_mutex_unlock(&backend->donatable_mutex);
 
             while (used_size > backend_size) {
@@ -459,7 +473,7 @@ static void *eph_mem_bpf_fault_thread(void *opaque)
                     if (backend->donatable_thread_exit) {
                         goto unregister;
                     }
-                    used_size = eph_mem_get_used_size(backend) + headroom_buffer_size;
+                    used_size = eph_mem_bpf_required_size(backend);
                 }
             }
 
