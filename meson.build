@@ -3645,6 +3645,7 @@ if have_system
     'hw/audio',
     'hw/block',
     'hw/char',
+    'hw/cxl',
     'hw/display',
     'hw/dma',
     'hw/fsi',

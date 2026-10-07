@@ -28,8 +28,10 @@
 #include "system/hostmem.h"
 #include "system/ramblock.h"
 #include "qemu/range.h"
+#include "qemu/timer.h"
 #include "qapi/qapi-types-cxl.h"
 #include "qapi/qapi-events-cxl.h"
+#include "trace.h"
 
 #define CXL_CAPACITY_MULTIPLIER   (256 * MiB)
 #define CXL_DC_EVENT_LOG_SIZE 8
@@ -3888,7 +3890,11 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
     CXLDCExtent *ent, *ent_next;
     CXLDCExtentList updated_list;
     uint32_t updated_list_size;
+    int64_t start_time_us, dry_run_time_us, apply_time_us;
+    int64_t event_build_time_us, end_time_us;
     CXLRetCode ret;
+
+    start_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     ret = cxl_detect_malformed_extent_list(ct3d, in, in_size);
     if (ret != CXL_MBOX_SUCCESS) {
@@ -3900,6 +3906,7 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
     if (ret != CXL_MBOX_SUCCESS) {
         return ret;
     }
+    dry_run_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
 
     /*
      * If the dry run release passes, the returned updated_list will
@@ -3920,6 +3927,7 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
                                     ct3d->dc.nr_extents_accepted);
 
     ct3d->dc.nr_extents_accepted = updated_list_size;
+    apply_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
 
     for (uint32_t i = 0; i < in_size; i++) {
         uint64_t dpa = in[i].start_dpa;
@@ -3959,8 +3967,13 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
             }
         }
     }
+    event_build_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
+
     qapi_event_send_cxl_release_dynamic_capacity(object_get_canonical_path_component(OBJECT(ct3d)), event_ext_list);
     qapi_free_CxlDynamicCapacityExtentList(event_ext_list);
+
+    end_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
+    trace_cxl_dc_extent_release(dry_run_time_us, apply_time_us, event_build_time_us, end_time_us);
 
     return CXL_MBOX_SUCCESS;
 }
