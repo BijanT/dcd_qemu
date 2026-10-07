@@ -3892,6 +3892,7 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
     uint32_t updated_list_size;
     int64_t start_time_us, dry_run_time_us, apply_time_us;
     int64_t event_build_time_us, end_time_us;
+    int64_t transaction_time_us;
     CXLRetCode ret;
 
     start_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -3926,12 +3927,13 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
         ct3_set_region_block_backed(ct3d, ent->start_dpa, ent->len);
         cxl_remove_extent_from_extent_list(&updated_list, ent);
     }
+    apply_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
     memory_region_transaction_commit();
+    transaction_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
     ct3d->dc.total_extent_count += (updated_list_size -
                                     ct3d->dc.nr_extents_accepted);
 
     ct3d->dc.nr_extents_accepted = updated_list_size;
-    apply_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
 
     for (uint32_t i = 0; i < in_size; i++) {
         uint64_t dpa = in[i].start_dpa;
@@ -3977,7 +3979,8 @@ CXLRetCode cxl_dc_extent_release(CXLType3Dev *ct3d, const CXLDCUpdatedExtent *in
     qapi_free_CxlDynamicCapacityExtentList(event_ext_list);
 
     end_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_time_us;
-    trace_cxl_dc_extent_release(dry_run_time_us, apply_time_us, event_build_time_us, end_time_us);
+    trace_cxl_dc_extent_release(dry_run_time_us, apply_time_us, transaction_time_us,
+                                event_build_time_us, end_time_us);
 
     return CXL_MBOX_SUCCESS;
 }

@@ -1,4 +1,4 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
 # cxl-mailbox-utils.c
-cxl_dc_extent_release(int64_t dry_run_us, int64_t apply_us, int64_t event_build_us, int64_t total_us) "dry_run_us=%"PRId64",apply_us=%"PRId64",event_build_us=%"PRId64",total_us=%"PRId64
+cxl_dc_extent_release(int64_t dry_run_us, int64_t apply_us, int64_t transaction_us, int64_t event_build_us, int64_t total_us) "dry_run_us=%"PRId64",apply_us=%"PRId64",transaction_is=%"PRId64",event_build_us=%"PRId64",total_us=%"PRId64
