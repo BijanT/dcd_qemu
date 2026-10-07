@@ -4,6 +4,7 @@
 #include "qemu/lockable.h"
 #include "qemu/main-loop.h"
 #include "qemu/mmap-alloc.h"
+#include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qemu/userfaultfd.h"
 #include "qapi/qapi-commands-eph-mem.h"
@@ -11,6 +12,7 @@
 #include "system/eph-mem.h"
 #include "system/hostmem.h"
 #include "qapi/error.h"
+#include "trace.h"
 
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -23,6 +25,12 @@ typedef struct EphMemBHRevokeData {
 #define MAX_PAGESIZE (2 * MiB)
 
 static void *eph_mem_zero_page = NULL;
+/*
+ * Timestamp of when the revocation was sent, which is compared when memory is
+ * returned. Having one variable assumes that only one revocation is in flight
+ * at a time, which is a fine assumption for our use case.
+ */
+static int64_t eph_mem_revoke_sent_time_us = 0;
 
 static int eph_mem_uffd_copy(int uffd_fd, void *dst_addr, void *src_addr,
         uint64_t length, uint64_t *copied)
@@ -52,6 +60,9 @@ void eph_mem_revoke_memory(const char *backend_path, uint64_t size)
     if (size == 0) {
         return;
     }
+
+    qatomic_set(&eph_mem_revoke_sent_time_us,
+                qemu_clock_get_us(QEMU_CLOCK_REALTIME));
 
     id = qatomic_fetch_inc(&next_id);
     qapi_event_send_eph_mem_revoke(backend_path, size, id);
@@ -129,7 +140,11 @@ static uint64_t eph_mem_get_used_size(HostMemoryBackend *backend)
 static int eph_mem_wait_for_return(HostMemoryBackend *backend)
 {
     struct pollfd pollfds[2];
+    int64_t start_time;
+    int64_t end_time;
     int ret;
+
+    start_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     pollfds[0].fd = event_notifier_get_fd(&backend->donatable_return_notifier);
     pollfds[0].events = POLLIN;
@@ -165,6 +180,9 @@ static int eph_mem_wait_for_return(HostMemoryBackend *backend)
     if (pollfds[1].revents & POLLIN) {
         event_notifier_test_and_clear(&backend->donatable_exit_notifier);
     }
+
+    end_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    trace_eph_mem_wait_for_return(end_time - start_time);
     return 0;
 }
 
@@ -730,6 +748,8 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
     uint64_t old_revoked_size;
     uint64_t new_revoked_size;
     uint64_t cmpxchg_ret;
+    int64_t return_time_us;
+    int64_t sent_time_us;
 
     /*
      * TODO: If id exists, check that it matches an in flight revocation
@@ -785,4 +805,8 @@ void qmp_eph_mem_return_capacity(const char *path, uint64_t size, bool has_id,
         } while (cmpxchg_ret != old_revoked_size);
         event_notifier_set(&backend->donatable_return_notifier);
     }
+    return_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    sent_time_us = qatomic_read(&eph_mem_revoke_sent_time_us);
+    trace_eph_mem_return_capacity(path, size, has_id ? id : 0,
+                                  return_time_us - sent_time_us);
 }
