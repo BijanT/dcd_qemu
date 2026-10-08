@@ -109,13 +109,18 @@ enum ListenerDirection { Forward, Reverse };
 #define MEMORY_LISTENER_CALL_GLOBAL(_callback, _direction, _args...)    \
     do {                                                                \
         MemoryListener *_listener;                                      \
+        int64_t time_us;                                                \
                                                                         \
         switch (_direction) {                                           \
         case Forward:                                                   \
             QTAILQ_FOREACH(_listener, &memory_listeners, link) {        \
+                time_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);        \
                 if (_listener->_callback) {                             \
                     _listener->_callback(_listener, ##_args);           \
                 }                                                       \
+                time_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL)         \
+                    - time_us;                                          \
+                trace_memory_listener_call(_listener->name, time_us);   \
             }                                                           \
             break;                                                      \
         case Reverse:                                                   \
@@ -1059,6 +1064,7 @@ static void flatviews_init(void)
 static void flatviews_reset(void)
 {
     AddressSpace *as;
+    int unique_flatviews = 0;
 
     if (flat_views) {
         g_hash_table_unref(flat_views);
@@ -1074,8 +1080,10 @@ static void flatviews_reset(void)
             continue;
         }
 
+        unique_flatviews++;
         generate_memory_topology(physmr);
     }
+    trace_memory_region_transaction_commit(0, unique_flatviews, 0, 0, 0);
 }
 
 static void address_space_set_flatview(AddressSpace *as)
