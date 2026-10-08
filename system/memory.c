@@ -1143,6 +1143,8 @@ void memory_region_transaction_begin(void)
 void memory_region_transaction_commit(void)
 {
     AddressSpace *as;
+    int64_t reset_us = 0, set_flatview_us = 0, update_ioevents_us = 0, listeners_us = 0;
+    int num_as = 0;
 
     assert(memory_region_transaction_depth);
     assert(bql_locked());
@@ -1150,17 +1152,33 @@ void memory_region_transaction_commit(void)
     --memory_region_transaction_depth;
     if (!memory_region_transaction_depth) {
         if (memory_region_update_pending) {
+            reset_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
             flatviews_reset();
+            reset_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - reset_us;
 
             MEMORY_LISTENER_CALL_GLOBAL(begin, Forward);
 
             QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+                int64_t local_set_flatview_us = 0;
+                int64_t local_update_ioevents_us = 0;
+
+                local_set_flatview_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
                 address_space_set_flatview(as);
+                local_set_flatview_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - local_set_flatview_us;
+                set_flatview_us += local_set_flatview_us;
+
+                local_update_ioevents_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
                 address_space_update_ioeventfds(as);
+                local_update_ioevents_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - local_update_ioevents_us;
+                update_ioevents_us += local_update_ioevents_us;
+                num_as++;
             }
             memory_region_update_pending = false;
             ioeventfd_update_pending = false;
+            listeners_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
             MEMORY_LISTENER_CALL_GLOBAL(commit, Forward);
+            listeners_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - listeners_us;
+            trace_memory_region_transaction_commit(reset_us, num_as, set_flatview_us, update_ioevents_us, listeners_us);
         } else if (ioeventfd_update_pending) {
             QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
                 address_space_update_ioeventfds(as);
