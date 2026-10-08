@@ -753,7 +753,9 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
 {
     int i;
     FlatView *view;
+    int64_t latency_us;
 
+    latency_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
     view = flatview_new(mr);
 
     if (mr) {
@@ -772,6 +774,9 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
     address_space_dispatch_compact(view->dispatch);
     g_hash_table_replace(flat_views, mr, view);
 
+    latency_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - latency_us;
+    if (mr)
+        trace_generate_memory_topology(memory_region_name(mr), latency_us);
     return view;
 }
 
