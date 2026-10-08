@@ -114,11 +114,11 @@ enum ListenerDirection { Forward, Reverse };
         switch (_direction) {                                           \
         case Forward:                                                   \
             QTAILQ_FOREACH(_listener, &memory_listeners, link) {        \
-                time_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);        \
+                time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);       \
                 if (_listener->_callback) {                             \
                     _listener->_callback(_listener, ##_args);           \
                 }                                                       \
-                time_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL)         \
+                time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME)        \
                     - time_us;                                          \
                 trace_memory_listener_call(_listener->name, time_us);   \
             }                                                           \
@@ -755,7 +755,7 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
     FlatView *view;
     int64_t latency_us;
 
-    latency_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+    latency_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     view = flatview_new(mr);
 
     if (mr) {
@@ -774,7 +774,7 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
     address_space_dispatch_compact(view->dispatch);
     g_hash_table_replace(flat_views, mr, view);
 
-    latency_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - latency_us;
+    latency_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - latency_us;
     if (mr)
         trace_generate_memory_topology(memory_region_name(mr), latency_us);
     return view;
@@ -1165,9 +1165,9 @@ void memory_region_transaction_commit(void)
     --memory_region_transaction_depth;
     if (!memory_region_transaction_depth) {
         if (memory_region_update_pending) {
-            reset_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+            reset_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             flatviews_reset();
-            reset_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - reset_us;
+            reset_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - reset_us;
 
             MEMORY_LISTENER_CALL_GLOBAL(begin, Forward);
 
@@ -1175,22 +1175,22 @@ void memory_region_transaction_commit(void)
                 int64_t local_set_flatview_us = 0;
                 int64_t local_update_ioevents_us = 0;
 
-                local_set_flatview_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+                local_set_flatview_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
                 address_space_set_flatview(as);
-                local_set_flatview_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - local_set_flatview_us;
+                local_set_flatview_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - local_set_flatview_us;
                 set_flatview_us += local_set_flatview_us;
 
-                local_update_ioevents_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+                local_update_ioevents_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
                 address_space_update_ioeventfds(as);
-                local_update_ioevents_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - local_update_ioevents_us;
+                local_update_ioevents_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - local_update_ioevents_us;
                 update_ioevents_us += local_update_ioevents_us;
                 num_as++;
             }
             memory_region_update_pending = false;
             ioeventfd_update_pending = false;
-            listeners_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+            listeners_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             MEMORY_LISTENER_CALL_GLOBAL(commit, Forward);
-            listeners_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - listeners_us;
+            listeners_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - listeners_us;
             trace_memory_region_transaction_commit(reset_us, num_as, set_flatview_us, update_ioevents_us, listeners_us);
         } else if (ioeventfd_update_pending) {
             QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
