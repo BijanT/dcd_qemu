@@ -1629,6 +1629,15 @@ int kvm_set_memory_attributes_shared(hwaddr start, uint64_t size)
     return kvm_set_memory_attributes(start, size, 0);
 }
 
+static bool kvm_skippable_region(MemoryRegionSection *section)
+{
+    MemoryRegion *mr = section->mr;
+    bool writable = !mr->readonly && !mr->rom_device;
+    bool mr_is_ram = memory_region_is_ram(mr);
+
+    return !mr_is_ram && (writable || !kvm_readonly_mem_allowed);
+}
+
 /* Called with KVMMemoryListener.slots_lock held */
 static void kvm_set_phys_mem(KVMMemoryListener *kml,
                              MemoryRegionSection *section, bool add)
@@ -1636,19 +1645,16 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     KVMSlot *mem;
     int err;
     MemoryRegion *mr = section->mr;
-    bool writable = !mr->readonly && !mr->rom_device;
     hwaddr start_addr, size, slot_size, mr_offset;
     ram_addr_t ram_start_offset;
     void *ram;
 
-    if (!memory_region_is_ram(mr)) {
-        if (writable || !kvm_readonly_mem_allowed) {
-            return;
-        } else if (!mr->romd_mode) {
-            /* If the memory device is not in romd_mode, then we actually want
-             * to remove the kvm memory slot so all accesses will trap. */
-            add = false;
-        }
+    if (kvm_skippable_region(section)) {
+        return;
+    } else if (!memory_region_is_ram(mr) && !mr->romd_mode) {
+        /* If the memory device is not in romd_mode, then we actually want
+         * to remove the kvm memory slot so all accesses will trap. */
+        add = false;
     }
 
     size = kvm_align_section(section, &start_addr);
@@ -1908,6 +1914,14 @@ static void kvm_region_commit(MemoryListener *listener)
     u2 = QSIMPLEQ_FIRST(&kml->transaction_add);
     while (u1 && u2) {
         Range r1, r2;
+
+        if (kvm_skippable_region(&u1->section)) {
+            u1 = QSIMPLEQ_NEXT(u1, next);
+            continue;
+        } else if (kvm_skippable_region(&u2->section)) {
+            u2 = QSIMPLEQ_NEXT(u2, next);
+            continue;
+        }
 
         range_init_nofail(&r1, u1->section.offset_within_address_space,
                           int128_get64(u1->section.size));
