@@ -1897,6 +1897,10 @@ static void kvm_region_commit(MemoryListener *listener)
                                           listener);
     KVMMemoryUpdate *u1, *u2;
     bool need_inhibit = false;
+    int64_t overlap_test_us = 0;
+    int64_t lock_inhibit_us = 0;
+    int64_t remove_us = 0;
+    int64_t add_us = 0;
 
     if (QSIMPLEQ_EMPTY(&kml->transaction_add) &&
         QSIMPLEQ_EMPTY(&kml->transaction_del)) {
@@ -1910,6 +1914,7 @@ static void kvm_region_commit(MemoryListener *listener)
      *
      * The lists are order by addresses, so it's easy to find overlaps.
      */
+    overlap_test_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     u1 = QSIMPLEQ_FIRST(&kml->transaction_del);
     u2 = QSIMPLEQ_FIRST(&kml->transaction_add);
     while (u1 && u2) {
@@ -1938,13 +1943,17 @@ static void kvm_region_commit(MemoryListener *listener)
             u2 = QSIMPLEQ_NEXT(u2, next);
         }
     }
+    overlap_test_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - overlap_test_us;
 
+    lock_inhibit_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     kvm_slots_lock();
     if (need_inhibit) {
         accel_ioctl_inhibit_begin();
     }
+    lock_inhibit_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - lock_inhibit_us;
 
     /* Remove all memslots before adding the new ones. */
+    remove_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     while (!QSIMPLEQ_EMPTY(&kml->transaction_del)) {
         u1 = QSIMPLEQ_FIRST(&kml->transaction_del);
         QSIMPLEQ_REMOVE_HEAD(&kml->transaction_del, next);
@@ -1954,6 +1963,8 @@ static void kvm_region_commit(MemoryListener *listener)
 
         g_free(u1);
     }
+    remove_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - remove_us;
+    add_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     while (!QSIMPLEQ_EMPTY(&kml->transaction_add)) {
         u1 = QSIMPLEQ_FIRST(&kml->transaction_add);
         QSIMPLEQ_REMOVE_HEAD(&kml->transaction_add, next);
@@ -1963,11 +1974,14 @@ static void kvm_region_commit(MemoryListener *listener)
 
         g_free(u1);
     }
+    add_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - add_us;
 
     if (need_inhibit) {
         accel_ioctl_inhibit_end();
     }
     kvm_slots_unlock();
+
+    trace_kvm_region_commit(overlap_test_us, lock_inhibit_us, remove_us, add_us, need_inhibit);
 }
 
 static void kvm_log_sync(MemoryListener *listener,
