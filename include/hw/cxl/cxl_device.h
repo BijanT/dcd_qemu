@@ -144,6 +144,7 @@ typedef enum {
 
 typedef struct CXLCCI CXLCCI;
 typedef struct cxl_device_state CXLDeviceState;
+typedef struct CXLFixedWindow CXLFixedWindow;
 struct cxl_cmd;
 typedef CXLRetCode (*opcode_handler)(const struct cxl_cmd *cmd,
                                      uint8_t *payload_in, size_t len_in,
@@ -743,6 +744,8 @@ struct CXLType3Dev {
 
     /* Keep track of maintenance requests */
     CXLMaintenanceList maint_list;
+
+    CXLFixedWindow *fixed_window;
 
     /* Poison Injection - cache */
     CXLPoisonList poison_list;

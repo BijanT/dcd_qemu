@@ -886,6 +886,7 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     uint16_t count;
 
     QTAILQ_INIT(&ct3d->error_list);
+    ct3d->fixed_window = NULL;
 
     if (!cxl_setup_memory(ct3d, errp)) {
         return;
@@ -1093,6 +1094,10 @@ static CXLFixedWindow *ct3_get_fixed_window(CXLType3Dev *ct3d)
     PCIHostState *hb;
     CXLHost *cxl_hb, *checked_hb;
 
+    if (ct3d->fixed_window) {
+        return ct3d->fixed_window;
+    }
+
     pdev = PCI_DEVICE(ct3d);
     rootbus = pci_device_root_bus(pdev);
     hb = PCI_HOST_BRIDGE(rootbus->qbus.parent);
@@ -1110,6 +1115,8 @@ static CXLFixedWindow *ct3_get_fixed_window(CXLType3Dev *ct3d)
         }
     }
     g_slist_free(fw_list);
+
+    ct3d->fixed_window = fw;
 
     return fw;
 }
