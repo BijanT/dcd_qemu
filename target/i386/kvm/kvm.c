@@ -3465,6 +3465,8 @@ static int xen_init(MachineState *ms, KVMState *s)
 int kvm_arch_init(MachineState *ms, KVMState *s)
 {
     int ret;
+    int quirks_supported;
+    uint64_t quirks_to_disable = 0;
     struct utsname utsname;
     Error *local_err = NULL;
     static bool first = true;
@@ -3605,20 +3607,36 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
      * preferable.  As well, the bochs video driver bug which motivated making
      * this a default-enabled quirk in KVM was fixed long ago.
      */
+    quirks_supported = kvm_check_extension(s, KVM_CAP_DISABLE_QUIRKS2);
     if (s->honor_guest_pat != ON_OFF_AUTO_OFF) {
-        ret = kvm_check_extension(s, KVM_CAP_DISABLE_QUIRKS2);
-        if (ret & KVM_X86_QUIRK_IGNORE_GUEST_PAT) {
-            ret = kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0,
-                                    KVM_X86_QUIRK_IGNORE_GUEST_PAT);
-            if (ret < 0) {
-                error_report("failed to disable KVM_X86_QUIRK_IGNORE_GUEST_PAT");
-                return ret;
-            }
+        if (quirks_supported & KVM_X86_QUIRK_IGNORE_GUEST_PAT) {
+            quirks_to_disable |= KVM_X86_QUIRK_IGNORE_GUEST_PAT;
         } else {
             if (s->honor_guest_pat == ON_OFF_AUTO_ON) {
                 error_report("KVM does not support disabling ignore-guest-PAT quirk");
                 return -EINVAL;
             }
+        }
+    }
+
+    /*
+     * By default, KVM zaps every SPTE in the VM, in all memslots, whenever a
+     * memslot is deleted or moved.  Removing a memslot only needs the deleted
+     * slot's mappings to be invalidated, and the whole-VM zap is expensive,
+     * for example when a CXL DC alias is disabled.
+     */
+    if (quirks_supported & KVM_X86_QUIRK_SLOT_ZAP_ALL) {
+        quirks_to_disable |= KVM_X86_QUIRK_SLOT_ZAP_ALL;
+    }
+
+    /* Disable all of the quirks in one call, in case the kernel replaces. */
+    if (quirks_to_disable) {
+        ret = kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0,
+                                quirks_to_disable);
+        if (ret < 0) {
+            error_report("failed to disable KVM quirks 0x%" PRIx64,
+                         quirks_to_disable);
+            return ret;
         }
     }
 
